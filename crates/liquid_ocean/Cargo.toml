@@ -1,0 +1,14 @@
+[package]
+name = "liquid_ocean"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.20.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+liquid_wave = { version = "0.1.0", path = "../liquid_wave" }
+wgpu = { version = "30.0.2", default-features = false, features = ["wgsl"] }
+
+[dev-dependencies]
+pollster = "1.0.3"
+wgpu = { version = "30.0.2", default-features = false, features = ["wgsl", "dx12", "vulkan"] }
