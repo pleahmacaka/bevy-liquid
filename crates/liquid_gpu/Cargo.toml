@@ -1,0 +1,18 @@
+[package]
+name = "liquid_gpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avian3d = "0.8.0"
+bevy = "0.20.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+liquid_ocean = { version = "0.1.0", path = "../liquid_ocean" }
+liquid_wave = { version = "0.1.0", path = "../liquid_wave" }
+wgpu = "30.0.2"
+
+[dev-dependencies]
+bytemuck = "1.25.2"
+glam = "0.34.3"
+liquid_ref = { path = "../liquid_ref" }
+pollster = "1.0.3"
