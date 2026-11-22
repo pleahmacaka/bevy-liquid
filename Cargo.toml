@@ -1,3 +1,15 @@
+[package]
+name = "bevy-liquid"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avian3d = "0.8.0"
+bevy = "0.20.1"
+liquid_gpu = { version = "0.1.0", path = "crates/liquid_gpu" }
+liquid_ocean = { version = "0.1.0", path = "crates/liquid_ocean" }
+liquid_wave = { version = "0.1.0", path = "crates/liquid_wave" }
+
 [workspace]
 members = ["crates/*"]
 resolver = "3"
