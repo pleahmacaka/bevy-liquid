@@ -96,7 +96,7 @@ fn main() {
 
 fn renderer() -> WgpuSettings {
     // DX12 needs wgpu's indirect-dispatch validation pass to feed num_workgroups, so it stays opt-in through WGPU_BACKEND
-    let backends = Backends::from_env().unwrap_or(Backends::all().difference(Backends::DX12));
+    let backends = Backends::from_env().unwrap_or_else(default_backends);
     let mut settings = WgpuSettings {
         backends: Some(backends),
         ..default()
@@ -107,6 +107,20 @@ fn renderer() -> WgpuSettings {
     }
 
     settings
+}
+
+fn default_backends() -> Backends {
+    let vulkan = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = bevy::tasks::block_on(vulkan.enumerate_adapters(Backends::VULKAN));
+
+    if adapters.iter().any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu) {
+        Backends::all().difference(Backends::DX12)
+    } else {
+        Backends::all()
+    }
 }
 
 fn bench_paths() -> Vec<DiagnosticPath> {

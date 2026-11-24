@@ -502,6 +502,7 @@ dependencies = [
  "liquid_gpu",
  "liquid_ocean",
  "liquid_wave",
+ "wgpu",
 ]
 
 [[package]]
