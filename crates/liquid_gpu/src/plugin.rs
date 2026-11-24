@@ -126,7 +126,7 @@ impl Plugin for LiquidPlugin {
                 )
                     .chain(),
             )
-            .add_systems(PostUpdate, apply_impulses);
+            .add_systems(Last, apply_impulses);
 
         let feedback = crate::feedback::Feedback::new((READBACK_FLOATS * 4) as u64);
         app.insert_resource(feedback.clone());
