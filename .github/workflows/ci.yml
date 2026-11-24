@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: 1.100.0
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cpu reference tests
+        run: cargo test --release -p liquid_ref -p liquid_wave
+
+      - name: gpu tests on lavapipe
+        run: |
+          vulkaninfo --summary
+          cargo test --release -p liquid_gpu -p liquid_ocean -- --test-threads=1
