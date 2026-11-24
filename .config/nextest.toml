@@ -1,0 +1,7 @@
+[profile.default]
+default-filter = "not test(/kleefsman|tiers_share|deep_scene_unknowns|floating_block|rayleigh|brick_fraction_and_timing|under_fxc/)"
+test-threads = 8
+
+[profile.validation]
+default-filter = "all()"
+test-threads = 1
