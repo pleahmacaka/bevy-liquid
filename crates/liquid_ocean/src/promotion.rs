@@ -58,8 +58,7 @@ const BINDINGS: [Binding; 8] = [
     Binding::Storage,
 ];
 
-const ENTRIES: [&str; 6] = [
-    "promote_reset",
+const ENTRIES: [&str; 5] = [
     "promote_vertical",
     "promote_cells",
     "promote_rows",
@@ -151,11 +150,10 @@ impl GpuPromotion {
         });
         let k = &self.kernel;
 
-        k.dispatch_grid(&mut pass, "promote_reset", &self.group, [1, 1]);
         k.dispatch(&mut pass, "promote_vertical", &self.group, self.cells);
         k.dispatch(&mut pass, "promote_cells", &self.group, self.cells);
-        k.dispatch(&mut pass, "promote_rows", &self.group, self.params.nz.max(1));
-        k.dispatch(&mut pass, "promote_columns", &self.group, self.params.nx + 1);
+        k.dispatch_grid(&mut pass, "promote_rows", &self.group, [self.params.nz.max(1), 1]);
+        k.dispatch_grid(&mut pass, "promote_columns", &self.group, [self.params.nx + 1, 1]);
         k.dispatch_grid(&mut pass, "promote_window", &self.group, [1, 1]);
     }
 

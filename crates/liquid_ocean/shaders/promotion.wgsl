@@ -33,7 +33,8 @@ const FLUX_Z: u32 = 2u;
 const VERTICAL: u32 = 3u;
 const SCORE_CAP: f32 = 4.0;
 const SCORE_SCALE: f32 = 256.0;
-const WINDOW_GROUP: u32 = 256u;
+const WINDOW_GROUP: u32 = 1024u;
+const LINE_GROUP: u32 = 256u;
 
 fn cell_count() -> u32 {
     return params.nx * params.nz;
@@ -129,8 +130,7 @@ fn weight(score: f32) -> u32 {
     return u32(floor(min(score, SCORE_CAP) * SCORE_SCALE + 0.5));
 }
 
-@compute @workgroup_size(1)
-fn promote_reset() {
+fn reset_result() {
     for (var s = 0u; s < 16u; s = s + 1u) {
         atomicStore(&result[s], 0u);
     }
@@ -141,6 +141,9 @@ fn promote_reset() {
 @compute @workgroup_size(64)
 fn promote_vertical(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
     let c = global_index(gid, groups);
+    if c == 0u {
+        reset_result();
+    }
     if c >= cell_count() {
         return;
     }
@@ -220,13 +223,15 @@ fn promote_cells(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
     indicators[c] = out;
 }
 
-@compute @workgroup_size(64)
-fn promote_rows(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let k = global_index(gid, groups);
+var<workgroup> line: array<u32, LINE_GROUP>;
+
+@compute @workgroup_size(256)
+fn promote_rows(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let k = wid.x;
     let row = params.nx + 1u;
 
     if k == 0u {
-        for (var i = 0u; i < row; i = i + 1u) {
+        for (var i = lid; i < row; i = i + LINE_GROUP) {
             table[i] = 0u;
         }
     }
@@ -235,26 +240,69 @@ fn promote_rows(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_work
         return;
     }
 
-    var acc = 0u;
-    table[(k + 1u) * row] = 0u;
+    if lid == 0u {
+        table[(k + 1u) * row] = 0u;
+    }
 
-    for (var i = 0u; i < params.nx; i = i + 1u) {
-        acc = acc + u32(history[cell_index(i, k)].w);
-        table[(k + 1u) * row + i + 1u] = acc;
+    var carry = 0u;
+
+    for (var start = 0u; start < params.nx; start = start + LINE_GROUP) {
+        let i = start + lid;
+        var value = 0u;
+
+        if i < params.nx {
+            value = u32(history[cell_index(i, k)].w);
+        }
+
+        line[lid] = value;
+        workgroupBarrier();
+
+        for (var offset = 1u; offset < LINE_GROUP; offset = offset * 2u) {
+            let add = select(0u, line[lid - offset], lid >= offset);
+            workgroupBarrier();
+            line[lid] = line[lid] + add;
+            workgroupBarrier();
+        }
+
+        if i < params.nx {
+            table[(k + 1u) * row + i + 1u] = carry + line[lid];
+        }
+
+        carry = carry + line[LINE_GROUP - 1u];
+        workgroupBarrier();
     }
 }
 
-@compute @workgroup_size(64)
-fn promote_columns(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = global_index(gid, groups);
+@compute @workgroup_size(256)
+fn promote_columns(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+    let i = wid.x;
     let row = params.nx + 1u;
+    var carry = 0u;
 
-    if i >= row {
-        return;
-    }
+    for (var start = 0u; start < params.nz; start = start + LINE_GROUP) {
+        let k = start + lid + 1u;
+        var value = 0u;
 
-    for (var k = 1u; k <= params.nz; k = k + 1u) {
-        table[k * row + i] = table[k * row + i] + table[(k - 1u) * row + i];
+        if k <= params.nz {
+            value = table[k * row + i];
+        }
+
+        line[lid] = value;
+        workgroupBarrier();
+
+        for (var offset = 1u; offset < LINE_GROUP; offset = offset * 2u) {
+            let add = select(0u, line[lid - offset], lid >= offset);
+            workgroupBarrier();
+            line[lid] = line[lid] + add;
+            workgroupBarrier();
+        }
+
+        if k <= params.nz {
+            table[k * row + i] = carry + line[lid];
+        }
+
+        carry = carry + line[LINE_GROUP - 1u];
+        workgroupBarrier();
     }
 }
 
@@ -268,7 +316,7 @@ fn better(sum: u32, distance: i32, index: u32, other: u32) -> bool {
     return sum > s || (sum == s && (distance < d || (distance == d && index < best_index[other])));
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn promote_window(@builtin(local_invocation_index) lid: u32) {
     let count = atomicLoad(&result[0]);
     let wx = clamp(params.window_x, 1u, params.nx);
