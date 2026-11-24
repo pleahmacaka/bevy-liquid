@@ -18,23 +18,20 @@ struct Whitewater {
 @group(1) @binding(1) var<uniform> origin_dx: vec4<f32>;
 
 @if(MULTISAMPLED) @group(0) @binding(10) var accum_texture: texture_multisampled_2d<f32>;
-@if(MULTISAMPLED) @group(0) @binding(11) var reveal_texture: texture_multisampled_2d<f32>;
 @if(!MULTISAMPLED) @group(0) @binding(10) var accum_texture: texture_2d<f32>;
-@if(!MULTISAMPLED) @group(0) @binding(11) var reveal_texture: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) corner: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) view_depth: f32,
-}
-
-struct Accumulation {
-    @location(0) accum: vec4<f32>,
-    @location(1) reveal: f32,
+    @location(1) tint: vec3<f32>,
+    @location(2) opacity: f32,
+    @location(3) view_depth: f32,
 }
 
 const FADE: f32 = 0.6;
+const SPRAY_COLOR: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
+const FOAM_COLOR: vec3<f32> = vec3<f32>(0.92, 0.95, 1.0);
+const BUBBLE_COLOR: vec3<f32> = vec3<f32>(0.75, 0.88, 0.95);
 
 @vertex
 fn vertex(@builtin(vertex_index) corner_index: u32, @builtin(instance_index) i: u32) -> VertexOutput {
@@ -51,7 +48,8 @@ fn vertex(@builtin(vertex_index) corner_index: u32, @builtin(instance_index) i: 
 
     if i >= whitewater.count {
         out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        out.color = vec4<f32>(0.0);
+        out.tint = vec3<f32>(0.0);
+        out.opacity = 0.0;
         return out;
     }
 
@@ -59,14 +57,17 @@ fn vertex(@builtin(vertex_index) corner_index: u32, @builtin(instance_index) i: 
     let p = whitewater.items[i];
     let kind = p.v.w;
     var radius = 0.45 * dx;
-    var color = vec4<f32>(0.92, 0.95, 1.0, clamp(p.x.w / FADE, 0.0, 1.0) * 0.8);
+    var tint = vec3<f32>(1.0, 1.0, 0.0);
+    var opacity = clamp(p.x.w / FADE, 0.0, 1.0) * 0.8;
 
     if kind < 0.5 {
         radius = 0.3 * dx;
-        color = vec4<f32>(1.0, 1.0, 1.0, 0.9);
+        tint = vec3<f32>(1.0, 0.0, 0.0);
+        opacity = 0.9;
     } else if kind > 1.5 {
         radius = 0.2 * dx;
-        color = vec4<f32>(0.75, 0.88, 0.95, 0.35);
+        tint = vec3<f32>(1.0, 0.0, 1.0);
+        opacity = 0.35;
     }
 
     let center = origin_dx.xyz + p.x.xyz;
@@ -76,7 +77,8 @@ fn vertex(@builtin(vertex_index) corner_index: u32, @builtin(instance_index) i: 
 
     out.clip_position = view.clip_from_world * world;
     out.view_depth = -(view.view_from_world * world).z;
-    out.color = color;
+    out.tint = tint;
+    out.opacity = opacity;
     return out;
 }
 
@@ -87,7 +89,7 @@ fn depth_weight(z: f32, alpha: f32) -> f32 {
 }
 
 @fragment
-fn accumulate(input: VertexOutput) -> Accumulation {
+fn accumulate(input: VertexOutput) -> @location(0) vec4<f32> {
     let r2 = dot(input.corner, input.corner);
 
     if r2 >= 1.0 {
@@ -95,9 +97,9 @@ fn accumulate(input: VertexOutput) -> Accumulation {
     }
 
     let falloff = 1.0 - r2;
-    let alpha = input.color.a * falloff * falloff;
+    let alpha = input.opacity * falloff * falloff;
     let w = depth_weight(input.view_depth, alpha);
-    return Accumulation(vec4<f32>(input.color.rgb * alpha, alpha) * w, alpha);
+    return vec4<f32>(input.tint * (alpha * w), alpha);
 }
 
 @fragment
@@ -110,12 +112,14 @@ fn composite(
     @if(MULTISAMPLED) let s = i32(sample_index);
     @else let s = 0;
 
-    let reveal = textureLoad(reveal_texture, p, s).r;
+    let accum = textureLoad(accum_texture, p, s);
+    let reveal = accum.a;
 
     if reveal > 0.999 {
         discard;
     }
 
-    let accum = textureLoad(accum_texture, p, s);
-    return vec4<f32>(accum.rgb / clamp(accum.a, 1.0e-4, 5.0e4), 1.0 - reveal);
+    let share = accum.yz / clamp(accum.x, 1.0e-4, 5.0e4);
+    let color = SPRAY_COLOR + share.x * (FOAM_COLOR - SPRAY_COLOR) + share.y * (BUBBLE_COLOR - SPRAY_COLOR);
+    return vec4<f32>(color, 1.0 - reveal);
 }

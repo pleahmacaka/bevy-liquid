@@ -32,7 +32,6 @@ use crate::solver::{Bind, GpuSolver, Profiler, Section, Slots};
 const SHADER_PATH: &str = "embedded://liquid_gpu/shaders/whitewater.wesl";
 const STATE_BYTES: u64 = std::mem::size_of::<GpuWhiteState>() as u64;
 const ACCUM_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
-const REVEAL_FORMAT: TextureFormat = TextureFormat::R16Float;
 
 pub struct WhitewaterPlugin;
 
@@ -114,7 +113,7 @@ fn init_whitewater_pipeline(mut commands: Commands, asset_server: Res<AssetServe
 
         BindGroupLayoutDescriptor::new(
             "whitewater composite",
-            &BindGroupLayoutEntries::with_indices(ShaderStages::FRAGMENT, ((10, entry()), (11, entry()))),
+            &BindGroupLayoutEntries::with_indices(ShaderStages::FRAGMENT, ((10, entry()),)),
         )
     };
 
@@ -172,7 +171,7 @@ impl SpecializedRenderPipeline for WhitewaterPipeline {
         };
         let product = BlendComponent {
             src_factor: BlendFactor::Zero,
-            dst_factor: BlendFactor::OneMinusSrc,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
             operation: BlendOperation::Add,
         };
 
@@ -189,18 +188,11 @@ impl SpecializedRenderPipeline for WhitewaterPipeline {
                 shader: self.shader.clone(),
                 shader_defs,
                 entry_point: Some("accumulate".into()),
-                targets: vec![
-                    Some(ColorTargetState {
-                        format: ACCUM_FORMAT,
-                        blend: Some(BlendState { color: sum, alpha: sum }),
-                        write_mask: ColorWrites::ALL,
-                    }),
-                    Some(ColorTargetState {
-                        format: REVEAL_FORMAT,
-                        blend: Some(BlendState { color: product, alpha: product }),
-                        write_mask: ColorWrites::ALL,
-                    }),
-                ],
+                targets: vec![Some(ColorTargetState {
+                    format: ACCUM_FORMAT,
+                    blend: Some(BlendState { color: sum, alpha: product }),
+                    write_mask: ColorWrites::ALL,
+                })],
                 ..default()
             }),
             depth_stencil: Some(DepthStencilState {
@@ -219,7 +211,6 @@ impl SpecializedRenderPipeline for WhitewaterPipeline {
 #[derive(Component)]
 struct WhitewaterTargets {
     accum: CachedTexture,
-    reveal: CachedTexture,
     accumulate: CachedRenderPipelineId,
     composite: CachedRenderPipelineId,
 }
@@ -280,7 +271,6 @@ fn prepare_whitewater_targets(
 
         commands.entity(entity).insert(WhitewaterTargets {
             accum: target("whitewater accum", ACCUM_FORMAT),
-            reveal: target("whitewater reveal", REVEAL_FORMAT),
             accumulate: pipelines.specialize(&cache, pipeline, key(false)),
             composite: pipelines.specialize(&cache, pipeline, key(true)),
         });
@@ -340,7 +330,7 @@ fn prepare_whitewater_bind_groups(
         let group = device.create_bind_group(
             "whitewater composite",
             &cache.get_bind_group_layout(layout),
-            &BindGroupEntries::with_indices(((10, &targets.accum.default_view), (11, &targets.reveal.default_view))),
+            &BindGroupEntries::with_indices(((10, &targets.accum.default_view),)),
         );
         commands.entity(entity).insert(WhitewaterComposite(group));
     }
@@ -370,7 +360,7 @@ fn accumulate_whitewater(
 
     let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("whitewater_accumulate"),
-        color_attachments: &[cleared(&targets.accum, wgpu::Color::TRANSPARENT), cleared(&targets.reveal, wgpu::Color::WHITE)],
+        color_attachments: &[cleared(&targets.accum, wgpu::Color::BLACK)],
         depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
         timestamp_writes: None,
         occlusion_query_set: None,
