@@ -63,6 +63,7 @@ pub struct SweBuffers {
     pub accumulated: wgpu::Buffer,
     pub ledger: wgpu::Buffer,
     pub profile: wgpu::Buffer,
+    pub steps: wgpu::Buffer,
 }
 
 impl SweBuffers {
@@ -86,6 +87,11 @@ impl SweBuffers {
     }
 }
 
+const CELL_ARGS: u64 = 0;
+const FACE_ARGS: u64 = 3;
+const SINGLE_ARGS: u64 = 6;
+const NEXT_ARGS: u64 = 9;
+
 pub const BINDINGS: [Binding; 14] = [
     Binding::Uniform,
     Binding::Storage,
@@ -103,12 +109,10 @@ pub const BINDINGS: [Binding; 14] = [
     Binding::Storage,
 ];
 
-const ENTRIES: [&str; 17] = [
+const ENTRIES: [&str; 15] = [
     "flux_state",
     "flux_stage",
     "begin_frame",
-    "begin_step",
-    "choose_dt",
     "drain_state",
     "drain_stage",
     "update_first",
@@ -288,6 +292,7 @@ pub struct GpuSwe {
     kernel: Kernel,
     pub buffers: SweBuffers,
     group: wgpu::BindGroup,
+    steps: wgpu::BindGroup,
     pub tracker: Option<SpongeTracker>,
     pub params: SweParams,
     pub cells: u32,
@@ -296,7 +301,7 @@ pub struct GpuSwe {
 
 impl GpuSwe {
     pub fn new(device: &wgpu::Device, swe: &Swe, dt_max: f32, shared: SharedBuffers) -> Self {
-        let kernel = Kernel::new(device, "swe", shaders::SWE, &BINDINGS, &ENTRIES);
+        let kernel = Kernel::with_group(device, "swe", shaders::SWE, &BINDINGS, &ENTRIES, &[Binding::Storage], &["choose_dt"]);
         let grid: Grid = swe.grid;
         let cells = grid.cells() as u32;
         let faces = (grid.x_faces() + grid.z_faces()) as u32;
@@ -341,9 +346,11 @@ impl GpuSwe {
                 bytemuck::bytes_of(&GpuLedger::new(swe.coupling)),
             ),
             profile: kernel::zeroed_storage(device, "swe profile", 32 * cells as u64),
+            steps: kernel::indirect_storage(device, "swe steps", 72),
         };
 
         let group = kernel.bind(device, "swe", &buffers.ordered_with_state(&buffers.state));
+        let steps = kernel.bind_extra(device, "swe steps", &[&buffers.steps]).expect("swe steps layout");
         let tracker = swe
             .sponge
             .as_ref()
@@ -361,6 +368,7 @@ impl GpuSwe {
             kernel,
             buffers,
             group,
+            steps,
             tracker,
             params,
             cells,
@@ -396,8 +404,8 @@ impl GpuSwe {
 
         self.encode_begin(&mut pass, &self.group);
 
-        for _ in 0..substeps {
-            self.encode_substep(&mut pass, &self.group, false);
+        for substep in 0..substeps {
+            self.encode_steps(&mut pass, &self.group, false, substep > 0);
         }
 
         self.encode_finish(&mut pass, &self.group);
@@ -417,30 +425,39 @@ impl GpuSwe {
         group: &wgpu::BindGroup,
         accumulate: bool,
     ) {
+        self.encode_steps(pass, group, accumulate, false);
+    }
+
+    fn encode_steps(&self, pass: &mut wgpu::ComputePass, group: &wgpu::BindGroup, accumulate: bool, gated: bool) {
         let k = &self.kernel;
+        let args = &self.buffers.steps;
+        let run = |pass: &mut wgpu::ComputePass, entry: &str, threads: u32, slot: u64| {
+            if gated {
+                k.dispatch_indirect(pass, entry, group, args, slot);
+            } else {
+                k.dispatch(pass, entry, group, threads);
+            }
+        };
+        let interface = |pass: &mut wgpu::ComputePass| {
+            if accumulate {
+                run(pass, "accumulate_flux", self.faces, FACE_ARGS);
+            } else if gated {
+                k.dispatch_indirect(pass, "ledger_faces_flux", group, args, SINGLE_ARGS);
+            } else {
+                k.dispatch_grid(pass, "ledger_faces_flux", group, [1, 1]);
+            }
+        };
 
-        k.dispatch(pass, "begin_step", group, 1);
-        k.dispatch(pass, "flux_state", group, self.faces);
+        run(pass, "flux_state", self.faces, NEXT_ARGS + FACE_ARGS);
+        pass.set_bind_group(1, &self.steps, &[]);
         k.dispatch(pass, "choose_dt", group, 1);
-        k.dispatch(pass, "drain_state", group, self.cells);
-
-        if accumulate {
-            k.dispatch(pass, "accumulate_flux", group, self.faces);
-        } else {
-            k.dispatch_grid(pass, "ledger_faces_flux", group, [1, 1]);
-        }
-
-        k.dispatch(pass, "update_first", group, self.cells);
-        k.dispatch(pass, "flux_stage", group, self.faces);
-        k.dispatch(pass, "drain_stage", group, self.cells);
-
-        if accumulate {
-            k.dispatch(pass, "accumulate_flux", group, self.faces);
-        } else {
-            k.dispatch_grid(pass, "ledger_faces_flux", group, [1, 1]);
-        }
-
-        k.dispatch(pass, "update_second", group, self.cells);
+        run(pass, "drain_state", self.cells, CELL_ARGS);
+        interface(pass);
+        run(pass, "update_first", self.cells, CELL_ARGS);
+        run(pass, "flux_stage", self.faces, FACE_ARGS);
+        run(pass, "drain_stage", self.cells, CELL_ARGS);
+        interface(pass);
+        run(pass, "update_second", self.cells, CELL_ARGS);
     }
 
     pub fn encode_clear_accumulated(&self, pass: &mut wgpu::ComputePass, group: &wgpu::BindGroup) {

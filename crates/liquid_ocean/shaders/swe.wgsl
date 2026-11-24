@@ -45,6 +45,7 @@ struct Clock {
 @group(0) @binding(11) var<storage, read> sponge: array<vec4<f32>>;
 @group(0) @binding(12) var<storage, read_write> accumulated: array<f32>;
 @group(0) @binding(13) var<storage, read_write> ledger: array<f32>;
+@group(1) @binding(0) var<storage, read_write> steps: array<u32>;
 
 const WALL: u32 = 0u;
 const TRANSMISSIVE: u32 = 1u;
@@ -412,16 +413,30 @@ fn begin_frame() {
     clock.remaining = params.frame_time;
     clock.elapsed = 0.0;
     clock.steps = 0u;
+    atomicStore(&clock.rate, 0u);
 }
 
-@compute @workgroup_size(1)
-fn begin_step() {
-    atomicStore(&clock.rate, 0u);
+const STEP_NOW: u32 = 0u;
+const STEP_NEXT: u32 = 9u;
+
+fn write_step_groups(slot: u32, threads: u32, run: bool) {
+    let groups = max((threads + 63u) / 64u, 1u);
+    steps[slot] = select(0u, min(groups, 65535u), run);
+    steps[slot + 1u] = (groups + 65534u) / 65535u;
+    steps[slot + 2u] = 1u;
+}
+
+fn write_steps(base: u32, run: bool) {
+    write_step_groups(base, cell_count(), run);
+    write_step_groups(base + 3u, face_count(), run);
+    steps[base + 6u] = select(0u, 1u, run);
+    steps[base + 7u] = 1u;
+    steps[base + 8u] = 1u;
 }
 
 @compute @workgroup_size(1)
 fn choose_dt() {
-    let rate = bitcast<f32>(atomicLoad(&clock.rate));
+    let rate = bitcast<f32>(atomicExchange(&clock.rate, 0u));
     var dt = min(params.dt_max, clock.remaining);
     if rate > 0.0 {
         dt = min(dt, params.cfl / rate);
@@ -434,6 +449,9 @@ fn choose_dt() {
     if dt > 0.0 {
         clock.steps = clock.steps + 1u;
     }
+
+    write_steps(STEP_NOW, dt > 0.0);
+    write_steps(STEP_NEXT, clock.remaining > 0.0);
 }
 
 fn outflow(i: u32, k: u32) -> f32 {
@@ -818,21 +836,60 @@ fn ledger_faces_accumulated(@builtin(local_invocation_index) lid: u32) {
     reduce_interface(lid, true);
 }
 
+struct LedgerCell {
+    h: f32,
+    book: vec2<f32>,
+    held: f32,
+    inside: bool,
+}
+
+fn ledger_cell(c: u32) -> LedgerCell {
+    let inside = in_coupling(c % params.nx, c / params.nx);
+    let held = select(0.0, coupled[c].x, inside);
+
+    return LedgerCell(state[c].x, stage[c].xy, held, inside);
+}
+
+fn tally_cell(sums: ptr<function, vec4<f32>>, tier: ptr<function, f32>, cell: LedgerCell) {
+    *sums = *sums + vec4<f32>(cell.book.x, cell.book.y, cell.h, 0.0);
+
+    if cell.inside {
+        *tier = *tier + cell.held;
+    } else {
+        (*sums).w = (*sums).w + cell.h;
+    }
+}
+
 @compute @workgroup_size(256)
 fn ledger_finish(@builtin(local_invocation_index) lid: u32) {
     var sums = vec4<f32>(0.0);
     var tier = 0.0;
+    let count = cell_count();
+    var c = lid;
 
-    for (var c = lid; c < cell_count(); c = c + LEDGER_GROUP) {
-        let h = state[c].x;
-        let book = stage[c];
-        sums = sums + vec4<f32>(book.x, book.y, h, 0.0);
+    while c + 7u * LEDGER_GROUP < count {
+        let c0 = ledger_cell(c + 0u * LEDGER_GROUP);
+        let c1 = ledger_cell(c + 1u * LEDGER_GROUP);
+        let c2 = ledger_cell(c + 2u * LEDGER_GROUP);
+        let c3 = ledger_cell(c + 3u * LEDGER_GROUP);
+        let c4 = ledger_cell(c + 4u * LEDGER_GROUP);
+        let c5 = ledger_cell(c + 5u * LEDGER_GROUP);
+        let c6 = ledger_cell(c + 6u * LEDGER_GROUP);
+        let c7 = ledger_cell(c + 7u * LEDGER_GROUP);
+        tally_cell(&sums, &tier, c0);
+        tally_cell(&sums, &tier, c1);
+        tally_cell(&sums, &tier, c2);
+        tally_cell(&sums, &tier, c3);
+        tally_cell(&sums, &tier, c4);
+        tally_cell(&sums, &tier, c5);
+        tally_cell(&sums, &tier, c6);
+        tally_cell(&sums, &tier, c7);
+        c = c + 8u * LEDGER_GROUP;
+    }
 
-        if in_coupling(c % params.nx, c / params.nx) {
-            tier = tier + coupled[c].x;
-        } else {
-            sums.w = sums.w + h;
-        }
+    while c < count {
+        tally_cell(&sums, &tier, ledger_cell(c));
+        c = c + LEDGER_GROUP;
     }
 
     let totals = reduce_partial(lid, sums);
