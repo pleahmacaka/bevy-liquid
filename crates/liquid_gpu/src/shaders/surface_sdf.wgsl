@@ -159,19 +159,46 @@ fn seed_closest(@builtin(global_invocation_id) gid: vec3<u32>) {
     closest_out[i] = out;
 }
 
-@compute @workgroup_size(256)
-fn spread_closest(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+const TILE: vec3<i32> = vec3<i32>(8, 8, 4);
+const HALO: vec3<i32> = vec3<i32>(10, 10, 6);
+const HALO_CELLS: u32 = 600u;
 
-    if i >= params.dims.w {
+var<workgroup> halo_points: array<vec4<f32>, HALO_CELLS>;
+
+fn halo_slot(p: vec3<i32>) -> u32 {
+    return u32(p.x + HALO.x * (p.y + HALO.y * p.z));
+}
+
+@compute @workgroup_size(256)
+fn spread_closest(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let origin = vec3<i32>(tile) * TILE;
+
+    for (var h = lid; h < HALO_CELLS; h = h + 256u) {
+        let p = vec3<i32>(i32(h % 10u), i32((h / 10u) % 10u), i32(h / 100u));
+        let n = origin + p - vec3<i32>(1);
+        var point = vec4<f32>(0.0);
+
+        if in_grid(n) {
+            point = closest_in[cell_index(n)].point;
+        }
+
+        halo_points[h] = point;
+    }
+
+    workgroupBarrier();
+
+    let local = vec3<i32>(i32(lid % 8u), i32((lid / 8u) % 8u), i32(lid / 64u));
+    let c = origin + local;
+
+    if !in_grid(c) {
         return;
     }
 
-    let c = cell_coords(i);
+    let i = cell_index(c);
     let here = vec3<f32>(c);
     var best = i;
     var best_d2 = 3.0e38;
-    let own = closest_in[i].point;
+    let own = halo_points[halo_slot(local + vec3<i32>(1))];
 
     if own.w > 0.5 {
         let e = own.xyz - here;
@@ -181,14 +208,8 @@ fn spread_closest(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var z = -1; z <= 1; z = z + 1) {
         for (var y = -1; y <= 1; y = y + 1) {
             for (var x = -1; x <= 1; x = x + 1) {
-                let n = c + vec3<i32>(x, y, z);
-
-                if !in_grid(n) {
-                    continue;
-                }
-
-                let k = cell_index(n);
-                let candidate = closest_in[k].point;
+                let o = vec3<i32>(x, y, z);
+                let candidate = halo_points[halo_slot(local + vec3<i32>(1) + o)];
 
                 if candidate.w < 0.5 {
                     continue;
@@ -198,7 +219,7 @@ fn spread_closest(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let d2 = dot(e, e);
 
                 if d2 < best_d2 {
-                    best = k;
+                    best = cell_index(c + o);
                     best_d2 = d2;
                 }
             }

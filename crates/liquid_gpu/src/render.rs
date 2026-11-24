@@ -282,6 +282,7 @@ pub struct SurfaceSdf {
     params_buffer: wgpu::Buffer,
     params: SdfParams,
     cell_groups: u32,
+    tile_groups: UVec3,
     brick_groups: UVec3,
 }
 
@@ -381,6 +382,7 @@ impl SurfaceSdf {
             params_buffer,
             params,
             cell_groups: cells.div_ceil(256),
+            tile_groups: (dims + UVec3::new(7, 7, 3)) / UVec3::new(8, 8, 4),
             brick_groups: bricks,
         }
     }
@@ -425,7 +427,7 @@ impl SurfaceSdf {
         for k in 0..SPREAD_PASSES {
             pass.set_pipeline(&self.spread);
             pass.set_bind_group(0, &self.binds[(k + 1) % 2], &[]);
-            pass.dispatch_workgroups(self.cell_groups, 1, 1);
+            pass.dispatch_workgroups(self.tile_groups.x, self.tile_groups.y, self.tile_groups.z);
         }
 
         pass.set_pipeline(&self.write);
