@@ -123,7 +123,7 @@ fn aniso_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r2 = r * r;
     let c = cell_of(xi);
 
-    if phi[cell_index(c)] < -SURFACE_BAND * params.dx {
+    if phi[cell_index(c)] < -surface_band() {
         let g = 1.0 / (ANISO_KN * params.dx);
         write_shape(i, xi, 2.0 / g, mat3x3<f32>(vec3<f32>(g, 0.0, 0.0), vec3<f32>(0.0, g, 0.0), vec3<f32>(0.0, 0.0, g)));
         return;
@@ -208,6 +208,14 @@ fn aniso_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     write_shape(i, mix(xi, mean, ANISO_LAMBDA), reach, g);
 }
 
+fn surface_band() -> f32 {
+    if params.physics.z > 0.0 {
+        return min(SURFACE_BAND, params.physics.z - 0.5) * params.dx;
+    }
+
+    return SURFACE_BAND * params.dx;
+}
+
 fn shape_scale(det: f32) -> f32 {
     return params.dx * params.dx * params.dx / 8.0 * det / 3.14159265;
 }
@@ -279,7 +287,7 @@ fn surface_field(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if !SPARSE || brick_live(c) {
         let here = phi[cell_index(c)];
-        let band = SURFACE_BAND * params.dx;
+        let band = surface_band();
 
         if here < -band {
             value = 1.0;

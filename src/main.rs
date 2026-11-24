@@ -184,7 +184,7 @@ fn domain(pool: Entity) -> LiquidDomain {
         cfl: 3.0,
         max_substeps: 6,
         whitewater_capacity: 1 << 17,
-        narrow_band: Some(3.0),
+        narrow_band: Some(2.0),
         block_smoothing: true,
         smoothing: 4,
         pressure_iterations: 5,
