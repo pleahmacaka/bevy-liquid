@@ -1113,55 +1113,40 @@ impl GpuSolver {
     }
 
     pub fn encode_frame_within(&self, encoder: &mut wgpu::CommandEncoder, profiler: Option<&Profiler>, budget: u32) {
-        {
-            let mut pass = self.section(encoder, profiler, Section::Plan, 0);
-            self.dispatch_direct(&mut pass, "begin_frame", Bind::Plan, 1);
-        }
+        let mut passes = Passes::new(encoder, profiler);
+        let pass = passes.section(Section::Plan, 0);
+        self.dispatch_direct(pass, "begin_frame", Bind::Plan, 1);
 
         for substep in 0..budget.clamp(1, self.config.max_substeps) {
-            {
-                let mut pass = self.section(encoder, profiler, Section::Sort, substep);
-                if substep > 0 {
-                    self.dispatch(&mut pass, "reset_speed", Bind::Sim, Slots::SINGLE);
-                }
+            let pass = passes.section(Section::Sort, substep);
 
-                if self.is_coupled() {
-                    self.dispatch(&mut pass, "measure_inflow", Bind::Coupling, Slots::PARTICLES);
-                    self.dispatch_direct(&mut pass, "plan_substep#grow", Bind::Plan, 1);
-                } else {
-                    self.dispatch(&mut pass, "measure_flow", Bind::Sim, Slots::PARTICLES);
-                    self.dispatch_direct(&mut pass, "plan_substep", Bind::Plan, 1);
-                }
-                self.encode_sort(&mut pass);
+            if substep > 0 {
+                self.dispatch(pass, "reset_speed", Bind::Sim, Slots::SINGLE);
             }
 
-            self.encode_substep(encoder, profiler, substep);
+            if self.is_coupled() {
+                self.dispatch(pass, "measure_inflow", Bind::Coupling, Slots::PARTICLES);
+                self.dispatch_direct(pass, "plan_substep#grow", Bind::Plan, 1);
+            } else {
+                self.dispatch(pass, "measure_flow", Bind::Sim, Slots::PARTICLES);
+                self.dispatch_direct(pass, "plan_substep", Bind::Plan, 1);
+            }
+
+            self.encode_sort(pass);
+            self.encode_substep_into(&mut passes, substep);
         }
 
-        let mut pass = self.section(encoder, profiler, Section::Surface, 0);
-        self.dispatch_direct(&mut pass, "open_all", Bind::Plan, 1);
-        self.encode_sorted(&mut pass, "sort_copy#surface");
+        let pass = passes.section(Section::Surface, 0);
+        self.dispatch_direct(pass, "open_all", Bind::Plan, 1);
+        self.encode_sorted(pass, "sort_copy#surface");
 
         if !self.config.has_band() {
-            self.dispatch(&mut pass, "liquid_phi", Bind::Sim, Slots::GRID);
+            self.dispatch(pass, "liquid_phi", Bind::Sim, Slots::GRID);
         }
 
-        self.encode_surface_field(&mut pass);
-        self.encode_columns(&mut pass);
-        drop(pass);
-        self.encode_whitewater(encoder, profiler);
-    }
-
-    pub(crate) fn section<'e>(
-        &self,
-        encoder: &'e mut wgpu::CommandEncoder,
-        profiler: Option<&'e Profiler>,
-        section: Section,
-        substep: u32,
-    ) -> wgpu::ComputePass<'e> {
-        let timestamp_writes = profiler.map(|p| p.writes(section, substep));
-
-        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(section.label()), timestamp_writes })
+        self.encode_surface_field(pass);
+        self.encode_columns(pass);
+        self.encode_whitewater_into(&mut passes);
     }
 
     pub fn encode_sort(&self, pass: &mut wgpu::ComputePass<'_>) {
@@ -1482,12 +1467,16 @@ impl GpuSolver {
     }
 
     pub fn encode_substep(&self, encoder: &mut wgpu::CommandEncoder, profiler: Option<&Profiler>, substep: u32) {
+        self.encode_substep_into(&mut Passes::new(encoder, profiler), substep);
+    }
+
+    fn encode_substep_into(&self, passes: &mut Passes<'_>, substep: u32) {
         let has_bodies = self.params.body_count > 0;
         let band = self.config.has_band();
         let tension = self.config.has_tension();
 
         {
-            let pass = &mut self.section(encoder, profiler, Section::Transfer, substep);
+            let pass = passes.section(Section::Transfer, substep);
 
             if band {
                 self.encode_band_advection(pass);
@@ -1516,7 +1505,7 @@ impl GpuSolver {
         }
 
         {
-            let pass = &mut self.section(encoder, profiler, Section::Geometry, substep);
+            let pass = passes.section(Section::Geometry, substep);
 
             if !band {
                 self.encode_geometry(pass);
@@ -1556,8 +1545,7 @@ impl GpuSolver {
             self.encode_tall_rhs(pass);
         }
 
-        let mut held = self.section(encoder, profiler, Section::Pressure, substep);
-        let pass = &mut held;
+        let pass = passes.section(Section::Pressure, substep);
         self.encode_solve(pass, has_bodies, self.config.pressure_iterations, self.has_tall());
 
         let fused = !tension && !self.has_tall();
@@ -1593,10 +1581,8 @@ impl GpuSolver {
             self.dispatch(pass, "constrain_solid", Bind::Sim, Slots::FACES);
         }
 
-        drop(held);
-
         if self.config.diffuses() {
-            let pass = &mut self.section(encoder, profiler, Section::Viscosity, substep);
+            let pass = passes.section(Section::Viscosity, substep);
 
             if tension {
                 self.encode_diffuse(pass, Diffusion::Capillary);
@@ -1607,8 +1593,7 @@ impl GpuSolver {
             }
         }
 
-        let mut held = self.section(encoder, profiler, Section::Advect, substep);
-        let pass = &mut held;
+        let pass = passes.section(Section::Advect, substep);
         let floor = self.config.open_floor.is_some();
 
         if floor && !band {
@@ -1640,10 +1625,8 @@ impl GpuSolver {
             self.dispatch(pass, "band_blend#store", Bind::Sim, Slots::FACES);
         }
 
-        drop(held);
-
         if self.config.density_projection && !band {
-            let pass = &mut self.section(encoder, profiler, Section::Density, substep);
+            let pass = passes.section(Section::Density, substep);
             self.encode_density_projection(pass);
         }
     }
@@ -2128,6 +2111,33 @@ impl Section {
 
     fn index(self) -> u32 {
         Section::ALL.iter().position(|s| *s == self).unwrap_or(0) as u32
+    }
+}
+
+pub(crate) struct Passes<'e> {
+    encoder: &'e mut wgpu::CommandEncoder,
+    profiler: Option<&'e Profiler>,
+    pass: Option<wgpu::ComputePass<'static>>,
+}
+
+impl<'e> Passes<'e> {
+    pub(crate) fn new(encoder: &'e mut wgpu::CommandEncoder, profiler: Option<&'e Profiler>) -> Self {
+        Self { encoder, profiler, pass: None }
+    }
+
+    pub(crate) fn section(&mut self, section: Section, substep: u32) -> &mut wgpu::ComputePass<'static> {
+        if self.profiler.is_some() {
+            self.pass = None;
+        }
+
+        let (encoder, profiler) = (&mut *self.encoder, self.profiler);
+
+        self.pass.get_or_insert_with(|| {
+            let timestamp_writes = profiler.map(|p| p.writes(section, substep));
+            let descriptor = wgpu::ComputePassDescriptor { label: Some(section.label()), timestamp_writes };
+
+            encoder.begin_compute_pass(&descriptor).forget_lifetime()
+        })
     }
 }
 

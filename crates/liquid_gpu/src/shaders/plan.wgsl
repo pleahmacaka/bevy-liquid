@@ -63,19 +63,27 @@ fn reset_speed() {
     atomicStore(&state.vmax_bits, 0u);
 }
 
-fn measure_particle(p: u32) {
+var<workgroup> group_speed: atomic<u32>;
+
+fn particle_speed(p: u32) -> u32 {
+    var bits = 0u;
+
     if p < state.particle_count {
-        atomicMax(&state.vmax_bits, bitcast<u32>(length(particles[p].v.xyz)));
+        bits = bitcast<u32>(length(particles[p].v.xyz));
     }
 
     if p < params.body_count {
-        atomicMax(&state.vmax_bits, bitcast<u32>(length(bodies[p].velocity.xyz)));
+        bits = max(bits, bitcast<u32>(length(bodies[p].velocity.xyz)));
     }
+
+    return bits;
 }
 
-fn measure_faces(first: u32, stride: u32) {
+fn face_speed(first: u32, stride: u32) -> u32 {
+    var bits = 0u;
+
     if params.physics.z <= 0.0 {
-        return;
+        return bits;
     }
 
     let items = select(face_total(), brick_list[0] * BRICK_FACES, SPARSE);
@@ -84,20 +92,35 @@ fn measure_faces(first: u32, stride: u32) {
         let n = brick_face(t);
 
         if n < face_total() {
-            atomicMax(&state.vmax_bits, bitcast<u32>(abs(velocity[n])));
+            bits = max(bits, bitcast<u32>(abs(velocity[n])));
         }
+    }
+
+    return bits;
+}
+
+fn record_speed(lid: u32, bits: u32) {
+    if lid == 0u {
+        atomicStore(&group_speed, 0u);
+    }
+
+    workgroupBarrier();
+    atomicMax(&group_speed, bits);
+    workgroupBarrier();
+
+    if lid == 0u {
+        atomicMax(&state.vmax_bits, atomicLoad(&group_speed));
     }
 }
 
 @compute @workgroup_size(256)
-fn measure_speed(@builtin(global_invocation_id) gid: vec3<u32>) {
-    measure_particle(gid.x);
+fn measure_speed(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    record_speed(lid, particle_speed(gid.x));
 }
 
 @compute @workgroup_size(256)
-fn measure_flow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    measure_particle(gid.x);
-    measure_faces(gid.x, groups.x * WG);
+fn measure_flow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, groups.x * WG)));
 }
 
 override PLAN_GROW: bool = false;

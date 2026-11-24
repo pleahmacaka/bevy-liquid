@@ -27,7 +27,7 @@ use bevy::shader::{Shader, ShaderDefVal};
 
 use crate::layout::{GpuWhite, GpuWhiteState};
 use crate::plugin::{LiquidDomain, LiquidFrame};
-use crate::solver::{Bind, GpuSolver, Profiler, Section, Slots};
+use crate::solver::{Bind, GpuSolver, Passes, Profiler, Section, Slots};
 
 const SHADER_PATH: &str = "embedded://liquid_gpu/shaders/whitewater.wesl";
 const STATE_BYTES: u64 = std::mem::size_of::<GpuWhiteState>() as u64;
@@ -412,6 +412,10 @@ fn composite_whitewater(
 
 impl GpuSolver {
     pub fn encode_whitewater(&self, encoder: &mut wgpu::CommandEncoder, profiler: Option<&Profiler>) {
+        self.encode_whitewater_into(&mut Passes::new(encoder, profiler));
+    }
+
+    pub(crate) fn encode_whitewater_into(&self, passes: &mut Passes<'_>) {
         if self.config.whitewater_capacity == 0 {
             return;
         }
@@ -422,7 +426,7 @@ impl GpuSolver {
             pass.dispatch_workgroups_indirect(&self.buffers.indirect, args);
         };
 
-        let pass = &mut self.section(encoder, profiler, Section::Whitewater, 0);
+        let pass = passes.section(Section::Whitewater, 0);
         self.dispatch(pass, "white_spawn#advect", Bind::Sim, Slots::PARTICLES);
         self.dispatch_direct(pass, "white_close", Bind::Plan, 1);
         white(pass, "white_copy");

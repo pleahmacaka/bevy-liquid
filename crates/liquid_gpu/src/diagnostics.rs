@@ -8,6 +8,7 @@ use crate::layout::GpuState;
 use crate::solver::{GpuSolver, Profiler, Section};
 
 const RING: usize = 4;
+const PROFILE_PERIOD: u32 = 4;
 const FREE: u8 = 0;
 const ENCODED: u8 = 1;
 const MAPPING: u8 = 2;
@@ -43,6 +44,7 @@ pub struct Sample {
 
 struct Slot {
     profiler: Option<Profiler>,
+    profiled: bool,
     state: wgpu::Buffer,
     status: Arc<AtomicU8>,
     encoded: u32,
@@ -51,13 +53,16 @@ struct Slot {
 
 impl Slot {
     fn buffers(&self) -> impl Iterator<Item = &wgpu::Buffer> {
-        std::iter::once(&self.state).chain(self.profiler.as_ref().map(Profiler::readback))
+        let profiler = self.profiler.as_ref().filter(|_| self.profiled);
+
+        std::iter::once(&self.state).chain(profiler.map(Profiler::readback))
     }
 }
 
 #[derive(Resource)]
 pub(crate) struct DiagnosticsRing {
     slots: Mutex<(u32, Vec<Slot>)>,
+    frames: AtomicU32,
     budget: AtomicU32,
     sender: Mutex<mpsc::Sender<Sample>>,
 }
@@ -78,7 +83,12 @@ pub(crate) fn build(app: &mut App) -> DiagnosticsRing {
         .insert_resource(DiagnosticsInbox(Mutex::new(receiver)))
         .add_systems(PreUpdate, record);
 
-    DiagnosticsRing { slots: Mutex::new((0, Vec::new())), budget: AtomicU32::new(u32::MAX), sender: Mutex::new(sender) }
+    DiagnosticsRing {
+        slots: Mutex::new((0, Vec::new())),
+        frames: AtomicU32::new(0),
+        budget: AtomicU32::new(u32::MAX),
+        sender: Mutex::new(sender),
+    }
 }
 
 fn record(inbox: Res<DiagnosticsInbox>, mut diagnostics: Diagnostics) {
@@ -87,8 +97,10 @@ fn record(inbox: Res<DiagnosticsInbox>, mut diagnostics: Diagnostics) {
     };
 
     for sample in receiver.try_iter() {
-        let total: f32 = sample.sections.iter().map(|s| s.1).sum();
-        diagnostics.add_measurement(&GPU_TIME, || total as f64);
+        if !sample.sections.is_empty() {
+            let total: f32 = sample.sections.iter().map(|s| s.1).sum();
+            diagnostics.add_measurement(&GPU_TIME, || total as f64);
+        }
 
         for (path, (_, ms)) in SECTIONS.iter().zip(&sample.sections) {
             diagnostics.add_measurement(path, || *ms as f64);
@@ -134,12 +146,14 @@ impl DiagnosticsRing {
             return;
         };
 
+        let profiler = slot.profiler.as_ref().filter(|_| self.frames.fetch_add(1, Ordering::AcqRel).is_multiple_of(PROFILE_PERIOD));
         let start = std::time::Instant::now();
-        solver.encode_frame_within(encoder, slot.profiler.as_ref(), budget);
+        solver.encode_frame_within(encoder, profiler, budget);
         slot.encode_ms = start.elapsed().as_secs_f32() * 1000.0;
         slot.encoded = budget;
+        slot.profiled = profiler.is_some();
 
-        if let Some(profiler) = &slot.profiler {
+        if let Some(profiler) = profiler {
             profiler.resolve(encoder);
         }
 
@@ -198,6 +212,7 @@ fn new_slot(device: &wgpu::Device, queue: &wgpu::Queue, substeps: u32) -> Slot {
 
     Slot {
         profiler,
+        profiled: false,
         state: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("liquid diagnostics state"),
             size: state_bytes(),
@@ -215,7 +230,7 @@ fn read(slot: &Slot) -> Option<Sample> {
         let view = slot.state.get_mapped_range(..).ok()?;
         *bytemuck::from_bytes(&view[..state_bytes() as usize])
     };
-    let sections = match &slot.profiler {
+    let sections = match slot.profiler.as_ref().filter(|_| slot.profiled) {
         Some(profiler) => {
             let view = profiler.readback().get_mapped_range(..).ok()?;
             profiler.milliseconds(bytemuck::cast_slice(&view), slot.encoded)

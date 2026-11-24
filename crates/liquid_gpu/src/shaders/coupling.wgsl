@@ -516,9 +516,8 @@ fn spawn_hash(s: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn measure_inflow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    measure_particle(gid.x);
-    measure_faces(gid.x, groups.x * WG);
+fn measure_inflow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, groups.x * WG)));
 
     for (var b = gid.x; b < boundary_cell_count(); b = b + groups.x * WG) {
         spawn_boundary(b);
