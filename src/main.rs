@@ -9,6 +9,8 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::light::GlobalAmbientLight;
 use bevy::pbr::{ExtendedMaterial, ScreenSpaceTransmission};
 use bevy::prelude::*;
+use bevy::render::RenderPlugin;
+use bevy::render::settings::{Backends, InstanceFlags, WgpuSettings};
 use bevy::time::TimeUpdateStrategy;
 use bevy::window::PresentMode;
 use liquid_gpu::caustics::{CausticMap, CausticMaterial, CausticReceiver};
@@ -57,15 +59,20 @@ fn main() {
             ..default()
         })
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "bevy liquid".into(),
-                    present_mode: if diagnostics { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync },
-                    desired_maximum_frame_latency: std::num::NonZeroU32::new(3),
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "bevy liquid".into(),
+                        present_mode: if diagnostics { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync },
+                        desired_maximum_frame_latency: std::num::NonZeroU32::new(3),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    render_creation: renderer().into(),
                     ..default()
                 }),
-                ..default()
-            }),
             PhysicsPlugins::default(),
             LiquidPlugin,
             LiquidOceanPlugin,
@@ -85,6 +92,21 @@ fn main() {
     }
 
     app.run();
+}
+
+fn renderer() -> WgpuSettings {
+    // DX12 needs wgpu's indirect-dispatch validation pass to feed num_workgroups, so it stays opt-in through WGPU_BACKEND
+    let backends = Backends::from_env().unwrap_or(Backends::all().difference(Backends::DX12));
+    let mut settings = WgpuSettings {
+        backends: Some(backends),
+        ..default()
+    };
+
+    if !cfg!(debug_assertions) && !backends.contains(Backends::DX12) {
+        settings.instance_flags = settings.instance_flags.difference(InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
+    }
+
+    settings
 }
 
 fn bench_paths() -> Vec<DiagnosticPath> {
