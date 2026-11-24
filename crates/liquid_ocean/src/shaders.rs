@@ -1,5 +1,6 @@
 pub const FFT: &str = concat!(
     include_str!("../shaders/fft.wgsl"),
+    include_str!("../shaders/fft_butterfly.wgsl"),
     include_str!("../shaders/complex.wgsl")
 );
 
@@ -10,6 +11,7 @@ pub const SWE: &str = concat!(
 
 pub const OCEAN: &str = concat!(
     include_str!("../shaders/ocean.wgsl"),
+    include_str!("../shaders/fft_butterfly.wgsl"),
     include_str!("../shaders/complex.wgsl")
 );
 

@@ -15,6 +15,7 @@ struct OceanParams {
 @group(0) @binding(2) var<storage, read> omega: array<f32>;
 @group(0) @binding(3) var<storage, read_write> spectrum: array<vec2<f32>>;
 @group(0) @binding(4) var<storage, read_write> surface: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> twiddles: array<vec2<f32>>;
 
 const TAU: f32 = 6.28318530718;
 
@@ -28,16 +29,11 @@ fn rotation(angle: f32) -> vec2<f32> {
     return vec2<f32>(cos(angle), sin(angle));
 }
 
-@compute @workgroup_size(64)
-fn evolve(@builtin(global_invocation_id) gid: vec3<u32>) {
+const COLUMN_ITEMS: u32 = 4u;
+
+fn evolved(cascade: u32, idx: u32, field: u32) -> vec2<f32> {
     let n = ocean.n;
     let cells = n * n;
-    let idx = gid.x;
-    let cascade = gid.y;
-    if idx >= cells || cascade >= ocean.cascades {
-        return;
-    }
-
     let base = cascade * cells;
     let w = omega[base + idx];
     let phase = rotation(-w * ocean.time);
@@ -67,29 +63,87 @@ fn evolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dzz = h * (-lambda * kz * uz);
     let dxz = h * (-lambda * kx * uz);
 
-    let out = base * 4u + idx;
-    spectrum[out] = eta + times_i(dx);
-    spectrum[out + cells] = dz + times_i(slope_x);
-    spectrum[out + 2u * cells] = slope_z + times_i(dxx);
-    spectrum[out + 3u * cells] = dzz + times_i(dxz);
+    switch field {
+        case 0u: {
+            return eta + times_i(dx);
+        }
+        case 1u: {
+            return dz + times_i(slope_x);
+        }
+        case 2u: {
+            return slope_z + times_i(dxx);
+        }
+        default: {
+            return dzz + times_i(dxz);
+        }
+    }
 }
 
-@compute @workgroup_size(64)
-fn assemble(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(256)
+fn evolve_rows(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let n = ocean.n;
-    let cells = n * n;
-    let idx = gid.x;
-    let cascade = gid.y;
-    if idx >= cells || cascade >= ocean.cascades {
-        return;
+    let log2n = countTrailingZeros(n);
+    let shift = 32u - log2n;
+    let row = wid.x;
+    let cascade = wid.y / 4u;
+    let field = wid.y % 4u;
+
+    for (var j = lid.x; j < n; j = j + THREADS) {
+        line[reverseBits(j) >> shift] = evolved(cascade, row * n + j, field);
     }
 
-    let packed = cascade * 4u * cells + idx;
-    let p0 = spectrum[packed];
-    let p1 = spectrum[packed + cells];
-    let p2 = spectrum[packed + 2u * cells];
-    let p3 = spectrum[packed + 3u * cells];
+    workgroupBarrier();
+    butterflies(lid.x, n, log2n, true, 1u);
 
+    let base = wid.y * n * n + row * n;
+
+    for (var j = lid.x; j < n; j = j + THREADS) {
+        spectrum[base + j] = line[j];
+    }
+}
+
+@compute @workgroup_size(256)
+fn columns_assemble(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let n = ocean.n;
+    let cells = n * n;
+    let log2n = countTrailingZeros(n);
+    let shift = 32u - log2n;
+    let column = wid.x;
+    let cascade = wid.y;
+    var kept: array<vec2<f32>, 16>;
+
+    for (var field = 0u; field < 4u; field = field + 1u) {
+        let base = (cascade * 4u + field) * cells + column;
+
+        for (var j = lid.x; j < n; j = j + THREADS) {
+            line[reverseBits(j) >> shift] = spectrum[base + j * n];
+        }
+
+        workgroupBarrier();
+        butterflies(lid.x, n, log2n, true, 1u);
+
+        for (var t = 0u; t < COLUMN_ITEMS; t = t + 1u) {
+            let j = lid.x + t * THREADS;
+
+            if j < n {
+                kept[field * COLUMN_ITEMS + t] = line[j];
+            }
+        }
+
+        workgroupBarrier();
+    }
+
+    for (var t = 0u; t < COLUMN_ITEMS; t = t + 1u) {
+        let j = lid.x + t * THREADS;
+
+        if j < n {
+            assemble(cascade, j * n + column, kept[t], kept[COLUMN_ITEMS + t], kept[2u * COLUMN_ITEMS + t], kept[3u * COLUMN_ITEMS + t]);
+        }
+    }
+}
+
+fn assemble(cascade: u32, idx: u32, p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>, p3: vec2<f32>) {
+    let cells = ocean.n * ocean.n;
     let eta = p0.x;
     let dx = p0.y;
     let dz = p1.x;

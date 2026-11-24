@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use liquid_wave::ocean::Ocean;
 
-use crate::fft::GpuFft;
+use crate::fft::{self, MAX_LENGTH};
 use crate::kernel::{self, Binding, Kernel};
 use crate::shaders;
 
@@ -66,7 +66,6 @@ pub fn spectrum_data(ocean: &Ocean) -> (Vec<[f32; 2]>, Vec<f32>) {
 
 pub struct GpuOcean {
     kernel: Kernel,
-    fft: GpuFft,
     group: wgpu::BindGroup,
     pub uniform: OceanUniform,
     pub params: wgpu::Buffer,
@@ -82,6 +81,10 @@ impl GpuOcean {
             ocean.cascades.len() <= MAX_CASCADES,
             "at most {MAX_CASCADES} cascades"
         );
+        assert!(
+            ocean.params.resolution.is_power_of_two() && ocean.params.resolution as u32 <= MAX_LENGTH,
+            "ocean resolution must be a power of two up to {MAX_LENGTH}"
+        );
 
         let kernel = Kernel::new(
             device,
@@ -93,8 +96,9 @@ impl GpuOcean {
                 Binding::ReadOnly,
                 Binding::Storage,
                 Binding::Storage,
+                Binding::ReadOnly,
             ],
-            &["evolve", "assemble"],
+            &["evolve_rows", "columns_assemble"],
         );
 
         let uniform = OceanUniform::from_ocean(ocean);
@@ -107,16 +111,16 @@ impl GpuOcean {
         let omega = kernel::storage(device, "ocean omega", bytemuck::cast_slice(&omega));
         let spectrum =
             kernel::zeroed_storage(device, "ocean spectrum", 8 * (n * n * fields) as u64);
+        let twiddles = fft::twiddles(n.max(2));
+        let twiddles = kernel::storage(device, "ocean twiddles", bytemuck::cast_slice(&twiddles));
         let group = kernel.bind(
             device,
             "ocean",
-            &[&params, &h0, &omega, &spectrum, &surface],
+            &[&params, &h0, &omega, &spectrum, &surface, &twiddles],
         );
-        let fft = GpuFft::new(device, &spectrum, n, n, fields);
 
         Self {
             kernel,
-            fft,
             group,
             uniform,
             params,
@@ -139,15 +143,11 @@ impl GpuOcean {
             timestamp_writes: None,
         });
 
-        let groups = [
-            (self.uniform.n * self.uniform.n).div_ceil(kernel::WORKGROUP),
-            self.uniform.cascades,
-        ];
+        let (n, cascades) = (self.uniform.n, self.uniform.cascades);
 
         self.kernel
-            .dispatch_grid(&mut pass, "evolve", &self.group, groups);
-        self.fft.encode(&mut pass, true);
+            .dispatch_grid(&mut pass, "evolve_rows", &self.group, [n, 4 * cascades]);
         self.kernel
-            .dispatch_grid(&mut pass, "assemble", &self.group, groups);
+            .dispatch_grid(&mut pass, "columns_assemble", &self.group, [n, cascades]);
     }
 }

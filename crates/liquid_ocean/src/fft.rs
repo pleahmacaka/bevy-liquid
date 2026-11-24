@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::kernel::{self, Binding, Kernel};
 use crate::shaders;
 
-const MAX_LENGTH: u32 = 1024;
+pub const MAX_LENGTH: u32 = 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -23,6 +23,15 @@ pub struct FftParams {
 struct Pass {
     group: wgpu::BindGroup,
     workgroups: [u32; 2],
+}
+
+pub fn twiddles(longest: u32) -> Vec<[f32; 2]> {
+    (0..longest / 2)
+        .map(|j| {
+            let angle = -TAU * j as f64 / longest as f64;
+            [angle.cos() as f32, angle.sin() as f32]
+        })
+        .collect()
 }
 
 pub struct GpuFft {
@@ -60,13 +69,7 @@ impl GpuFft {
         );
 
         let longest = width.max(height).max(2);
-        let twiddles: Vec<[f32; 2]> = (0..longest / 2)
-            .map(|j| {
-                let angle = -TAU * j as f64 / longest as f64;
-                [angle.cos() as f32, angle.sin() as f32]
-            })
-            .collect();
-        let twiddles = kernel::storage(device, "fft twiddles", bytemuck::cast_slice(&twiddles));
+        let twiddles = kernel::storage(device, "fft twiddles", bytemuck::cast_slice(&twiddles(longest)));
 
         let make = |n: u32, stride: u32, line_stride: u32, lines: u32, inverse: bool| {
             let params = FftParams {
