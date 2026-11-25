@@ -1,5 +1,5 @@
-const BAND_PER_CELL: u32 = 8u;
-const BAND_CROWDED: u32 = 16u;
+override BAND_PER_CELL: u32 = PER_CELL;
+override BAND_CROWDED: u32 = 2u * PER_CELL;
 const BAND_JITTER: f32 = 0.8;
 
 fn band_depth() -> f32 {
@@ -12,6 +12,11 @@ fn combination_depth() -> f32 {
 
 fn backtrace(x: vec3<f32>, dt: f32) -> vec3<f32> {
     let k1 = sample_velocity(x);
+
+    if BACKTRACE_ORDER < 4u {
+        return x - dt * sample_velocity(x - 0.5 * dt * k1);
+    }
+
     let k2 = sample_velocity(x - 0.5 * dt * k1);
     let k3 = sample_velocity(x - 0.5 * dt * k2);
     let k4 = sample_velocity(x - dt * k3);
@@ -20,14 +25,14 @@ fn backtrace(x: vec3<f32>, dt: f32) -> vec3<f32> {
 }
 
 @compute @workgroup_size(256)
-fn band_forward(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn band_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = brick_face(gid.x);
 
     if n < face_total() {
         forward_face(n);
     }
 
-    let stride = groups.x * WG;
+    let stride = dispatched_threads(FACE_SLOT);
 
     for (var t = gid.x; t < select(cell_count(), brick_list[0] * BRICK_CELLS, SPARSE); t = t + stride) {
         let c = brick_cell(t);
@@ -109,7 +114,7 @@ fn advect_cell_phi(n: u32) {
 }
 
 fn adopted(n: u32, d: f32) -> f32 {
-    let solid = params.body_count > 0u && solid_phi_at_cell(cell_coords(n)) < 0.0;
+    let solid = has_solids() && solid_phi_at_cell(cell_coords(n)) < 0.0;
 
     return select(d, BIG, solid);
 }
@@ -139,6 +144,18 @@ fn face_depth(axis: u32, f: vec3<i32>) -> f32 {
     return phi[cell_index(f)];
 }
 
+fn poured(axis: u32, f: vec3<i32>) -> bool {
+    if emission.count.x == 0u {
+        return false;
+    }
+
+    let lo = bump(f, axis, -1);
+    let below = lo[axis] < 0 || band_phi[cell_index(lo)] >= 0.0;
+    let above = f[axis] >= i32(params.dims[axis]) || band_phi[cell_index(f)] >= 0.0;
+
+    return below && above;
+}
+
 @compute @workgroup_size(256)
 fn band_pick(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = brick_face(gid.x);
@@ -148,10 +165,11 @@ fn band_pick(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let axis = face_axis(n);
-    let depth = face_depth(axis, face_coords(axis, n));
+    let f = face_coords(axis, n);
+    let depth = face_depth(axis, f);
     let first = scalars[S_BAND_DT] <= 0.0;
 
-    if valid[n] > 0.0 && (depth >= -combination_depth() || first) {
+    if valid[n] > 0.0 && (depth >= -combination_depth() || first || poured(axis, f)) {
         valid[n] = 1.0;
         return;
     }
@@ -213,7 +231,25 @@ fn band_volume_final(lane: Lane) {
     let total = volume_total(lane);
 
     if lane.index == 0u {
+        credit_target();
         settle_volume(total);
+    }
+}
+
+const S_VOLUME_EMITTED: u32 = 127u;
+
+fn credit_emitted(volume: f32) -> f32 {
+    let sum = volume + scalars[S_VOLUME_EMITTED];
+    scalars[S_VOLUME_EMITTED] = scalars[S_VOLUME_EMITTED] - (sum - volume);
+
+    return sum;
+}
+
+fn credit_target() {
+    if scalars[S_VOLUME_TARGET] > 0.0 {
+        scalars[S_VOLUME_TARGET] = credit_emitted(scalars[S_VOLUME_TARGET]);
+    } else {
+        scalars[S_VOLUME_EMITTED] = 0.0;
     }
 }
 
@@ -262,7 +298,7 @@ fn band_volume_rhs(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(256)
-fn band_blend(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn band_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = brick_face(gid.x);
 
     if n < face_total() && valid[n] <= 1.5 {
@@ -271,7 +307,7 @@ fn band_blend(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     }
 
     if BAND_STORE {
-        for (var t = gid.x; t < select(cell_count(), brick_list[0] * BRICK_CELLS, SPARSE); t = t + groups.x * WG) {
+        for (var t = gid.x; t < select(cell_count(), brick_list[0] * BRICK_CELLS, SPARSE); t = t + dispatched_threads(FACE_SLOT)) {
             let c = brick_cell(t);
 
             if c < cell_count() {
@@ -322,7 +358,7 @@ fn seed_point(c: vec3<i32>, s: u32, salt: u32) -> vec3<f32> {
     let cell = vec3<u32>(c);
     let seed = (cell.x * 73856093u) ^ (cell.y * 19349663u) ^ (cell.z * 83492791u) ^ (s * 2654435761u) ^ salt;
     let jitter = vec3<f32>(hash_unit(seed), hash_unit(seed ^ 0x9E3779B9u), hash_unit(seed ^ 0x7F4A7C15u));
-    let sub = vec3<f32>(f32(s & 1u), f32((s >> 1u) & 1u), f32((s >> 2u) & 1u));
+    let sub = sub_octant(s);
     let local = (sub + 0.5 + (jitter - 0.5) * BAND_JITTER) * 0.5;
 
     return (vec3<f32>(c) + local) * params.dx;
@@ -348,7 +384,7 @@ fn band_count(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
 
-        if resampled && members >= BAND_CROWDED {
+        if (resampled || CULL_CROWDED) && members >= BAND_CROWDED {
             particles[i].v.w = 1.0;
             continue;
         }
@@ -368,7 +404,7 @@ fn band_count(@builtin(global_invocation_id) gid: vec3<u32>) {
                 break;
             }
 
-            if (occupied & (1u << s)) != 0u || !in_band(seed_point(c, s, salt)) {
+            if (occupied & (1u << seed_octant(s))) != 0u || !in_band(seed_point(c, s, salt)) {
                 continue;
             }
 
@@ -469,7 +505,7 @@ fn band_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s1 = interpolate_axis(h, 1u, x);
         let s2 = interpolate_axis(h, 2u, x);
         particles[i].v = vec4<f32>(s0.v, s1.v, s2.v, 0.0);
-        particles[i].c0 = vec4<f32>(s0.c, 0.0);
+        particles[i].c0 = vec4<f32>(s0.c, params.thermal.x);
         particles[i].c1 = vec4<f32>(s1.c, 0.0);
         particles[i].c2 = vec4<f32>(s2.c, 0.0);
     }

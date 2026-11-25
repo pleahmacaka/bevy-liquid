@@ -119,8 +119,8 @@ fn measure_speed(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_i
 }
 
 @compute @workgroup_size(256)
-fn measure_flow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, groups.x * WG)));
+fn measure_flow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, dispatched_threads(PARTICLE_SLOT))));
 }
 
 override PLAN_GROW: bool = false;
@@ -228,6 +228,6 @@ fn floor_grow() {
         return;
     }
 
-    state.particle_count = min(state.particle_count + FLOOR_SPAWN * params.dims.x * params.dims.z, params.particle_capacity);
+    state.particle_count = min(state.particle_count + PER_CELL * params.dims.x * params.dims.z, params.particle_capacity);
     indirect[3u * PARTICLE_SLOT] = particle_groups();
 }

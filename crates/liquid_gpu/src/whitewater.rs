@@ -26,7 +26,7 @@ use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use bevy::shader::{Shader, ShaderDefVal};
 
 use crate::layout::{GpuWhite, GpuWhiteState};
-use crate::plugin::{LiquidDomain, LiquidFrame};
+use crate::plugin::LiquidFrame;
 use crate::solver::{Bind, GpuSolver, Passes, Profiler, Section, Slots};
 
 const SHADER_PATH: &str = "embedded://liquid_gpu/shaders/whitewater.wesl";
@@ -38,7 +38,6 @@ pub struct WhitewaterPlugin;
 impl Plugin for WhitewaterPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/whitewater.wesl");
-        app.add_systems(Update, spawn_whitewater_view);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -68,26 +67,16 @@ impl Plugin for WhitewaterPlugin {
     }
 }
 
-fn spawn_whitewater_view(
-    domains: Query<&LiquidDomain, Added<LiquidDomain>>,
-    mut buffers: ResMut<Assets<ShaderBuffer>>,
-    mut frame: ResMut<LiquidFrame>,
-) {
-    let Some(domain) = domains.iter().next() else {
-        return;
-    };
-
-    let capacity = domain.config.whitewater_capacity;
-
+pub(crate) fn whitewater_buffer(capacity: u32, buffers: &mut Assets<ShaderBuffer>) -> Handle<ShaderBuffer> {
     if capacity == 0 {
-        return;
+        return Handle::default();
     }
 
     let bytes = STATE_BYTES + capacity as u64 * std::mem::size_of::<GpuWhite>() as u64;
     let mut buffer = ShaderBuffer::with_size(bytes, RenderAssetUsages::RENDER_WORLD);
     buffer.buffer_usage |= BufferUsages::COPY_DST;
 
-    frame.whitewater = buffers.add(buffer);
+    buffers.add(buffer)
 }
 
 #[derive(Resource)]

@@ -345,6 +345,8 @@ fn retarget() {
     let current = scalars[S_VOLUME_TARGET];
 
     if current <= 0.0 {
+        credit_target();
+
         if hf_ledger[L_ARMED] > 0.5 {
             hf_ledger[L_HOLD] = 1.0;
         }
@@ -352,14 +354,16 @@ fn retarget() {
     }
 
     if hf_ledger[L_ARMED] < 0.5 {
-        hf_ledger[L_REFERENCE] = current - exchanged;
+        credit_target();
+        hf_ledger[L_REFERENCE] = scalars[S_VOLUME_TARGET] - exchanged;
         hf_ledger[L_ARMED] = 1.0;
         return;
     }
 
-    if hf_ledger[L_HOLD] < 0.5 {
-        scalars[S_VOLUME_TARGET] = hf_ledger[L_REFERENCE] + exchanged;
-    }
+    let reference = credit_emitted(hf_ledger[L_REFERENCE]);
+    let held = current + (reference - hf_ledger[L_REFERENCE]);
+    hf_ledger[L_REFERENCE] = reference;
+    scalars[S_VOLUME_TARGET] = select(held, reference + exchanged, hf_ledger[L_HOLD] < 0.5);
 }
 
 fn previous_region(i: i32, k: i32) -> bool {
@@ -399,7 +403,7 @@ fn seed_level(xz: vec2<f32>) -> f32 {
 }
 
 fn seed_position(c: vec3<i32>, s: u32) -> vec3<f32> {
-    let sub = vec3<f32>(f32(s & 1u), f32((s >> 1u) & 1u), f32((s >> 2u) & 1u));
+    let sub = sub_octant(s);
     let u = vec3<u32>(c);
     let seed = (u.x * 73856093u) ^ (u.y * 19349663u) ^ (u.z * 83492791u) ^ (s * 2654435761u);
     let jitter = vec3<f32>(spawn_hash(seed), spawn_hash(seed ^ 0x9E3779B9u), spawn_hash(seed ^ 0x7F4A7C15u)) - 0.5;
@@ -429,7 +433,7 @@ fn seed_column(column: u32, offset: u32, write: bool) -> u32 {
                 var p: Particle;
                 p.x = vec4<f32>(x, -1.0);
                 p.v = vec4<f32>(column_target(x).xyz, 0.0);
-                p.c0 = vec4<f32>(0.0);
+                p.c0 = vec4<f32>(vec3<f32>(0.0), params.thermal.x);
                 p.c1 = vec4<f32>(0.0);
                 p.c2 = vec4<f32>(0.0);
                 particles[offset + n] = p;
@@ -469,8 +473,8 @@ fn couple_seed(lane: Lane) {
     }
 }
 
-const SPAWN_PER_CELL: u32 = 8u;
-const SPAWN_FULL: u32 = 6u;
+override SPAWN_PER_CELL: u32 = PER_CELL;
+override SPAWN_FULL: u32 = 3u * PER_CELL / 4u;
 
 fn boundary_cell_count() -> u32 {
     let d = params.dims;
@@ -516,10 +520,10 @@ fn spawn_hash(s: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn measure_inflow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, groups.x * WG)));
+fn measure_inflow(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    record_speed(lid, max(particle_speed(gid.x), face_speed(gid.x, dispatched_threads(PARTICLE_SLOT))));
 
-    for (var b = gid.x; b < boundary_cell_count(); b = b + groups.x * WG) {
+    for (var b = gid.x; b < boundary_cell_count(); b = b + dispatched_threads(PARTICLE_SLOT)) {
         spawn_boundary(b);
     }
 }
@@ -544,12 +548,12 @@ fn spawn_boundary(b: u32) {
         }
 
         var p: Particle;
-        p.c0 = vec4<f32>(0.0);
+        p.c0 = vec4<f32>(vec3<f32>(0.0), params.thermal.x);
         p.c1 = vec4<f32>(0.0);
         p.c2 = vec4<f32>(0.0);
         p.v = vec4<f32>(0.0, 0.0, 0.0, 1.0);
 
-        let sub = vec3<f32>(f32(s & 1u), f32((s >> 1u) & 1u), f32((s >> 2u) & 1u));
+        let sub = sub_octant(s);
         let seed = (b * 8u + s) ^ salt;
         let jitter = vec3<f32>(spawn_hash(seed), spawn_hash(seed ^ 0x9E3779B9u), spawn_hash(seed ^ 0x7F4A7C15u)) - 0.5;
         let x = (vec3<f32>(c) + (sub + 0.5 + 0.8 * jitter) * 0.5) * params.dx;

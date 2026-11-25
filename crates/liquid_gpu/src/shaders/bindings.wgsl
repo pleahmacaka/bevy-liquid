@@ -14,12 +14,15 @@
 @group(0) @binding(13) var<storage, read_write> nodes: array<f32>;
 @group(0) @binding(14) var<storage, read_write> bodies: array<Body>;
 @group(0) @binding(15) var<storage, read_write> state: State;
+@group(0) @binding(16) var<storage, read_write> packed: array<vec2<u32>>;
 @group(0) @binding(17) var<storage, read_write> scalars: array<f32>;
 @group(0) @binding(18) var<storage, read_write> partials: array<f32>;
 @group(0) @binding(19) var<storage, read_write> scratch_valid: array<f32>;
 @group(0) @binding(20) var<storage, read_write> pressure_keep: array<f32>;
 @group(0) @binding(26) var<storage, read_write> brick_flags: array<atomic<u32>>;
 @group(0) @binding(27) var<storage, read_write> brick_list: array<u32>;
+@group(0) @binding(28) var<storage, read> dispatch_args: array<u32>;
+@group(0) @binding(29) var<storage, read> static_solid: array<f32>;
 @group(2) @binding(12) var<storage, read_write> band_phi: array<f32>;
 @group(2) @binding(13) var<storage, read_write> signed_distance: array<f32>;
 @group(2) @binding(14) var<storage, read_write> sweep_a: array<f32>;
@@ -34,3 +37,8 @@
 @group(2) @binding(23) var<storage, read_write> v_d: array<f32>;
 @group(2) @binding(24) var<storage, read_write> v_q: array<f32>;
 @group(2) @binding(25) var<storage, read_write> band_offsets: array<u32>;
+@group(2) @binding(28) var<storage, read_write> v_z: array<f32>;
+@group(2) @binding(29) var<storage, read_write> v_e: array<f32>;
+@group(2) @binding(30) var<storage, read_write> v_w: array<f32>;
+@group(2) @binding(31) var<storage, read_write> v_k: array<f32>;
+@group(2) @binding(32) var<storage, read_write> v_samples: array<f32>;

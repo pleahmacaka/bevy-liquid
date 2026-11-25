@@ -38,6 +38,10 @@ const SPRAY_CHECK: f32 = 12.0;
 const SPHERE_SHARE: f32 = 4.18879 / 8.0;
 const NORMAL_VALID: f32 = 0.5;
 
+fn spray_neighbors() -> u32 {
+    return max(SPRAY_NEIGHBORS * PER_CELL / 8u, 1u);
+}
+
 fn white_hash(n: u32) -> u32 {
     let s = n * 747796405u + 2891336453u;
     let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
@@ -54,6 +58,10 @@ fn potential(value: f32, lo: f32, hi: f32) -> f32 {
 }
 
 fn white_dt() -> f32 {
+    if LATE_SURFACE {
+        return params.frame_dt;
+    }
+
     return max(params.frame_dt - state.remaining, 0.0);
 }
 
@@ -211,7 +219,7 @@ fn close_neighbors(x: vec3<f32>, c: vec3<i32>, lo: vec3<i32>, hi: vec3<i32>) -> 
                 j = j + 1u;
             }
 
-            if count >= SPRAY_NEIGHBORS {
+            if count >= spray_neighbors() {
                 return count;
             }
         }
@@ -246,9 +254,9 @@ fn white_kind(x: vec3<f32>) -> f32 {
         }
     }
 
-    expected = expected * SPHERE_SHARE;
+    expected = expected * SPHERE_SHARE * per_cell_scale();
 
-    if bound < SPRAY_NEIGHBORS {
+    if bound < spray_neighbors() {
         return WHITE_SPRAY;
     }
 
@@ -256,7 +264,7 @@ fn white_kind(x: vec3<f32>) -> f32 {
         return WHITE_BUBBLE;
     }
 
-    if expected < SPRAY_CHECK && close_neighbors(x, c, lo, hi) < SPRAY_NEIGHBORS {
+    if expected < SPRAY_CHECK && close_neighbors(x, c, lo, hi) < spray_neighbors() {
         return WHITE_SPRAY;
     }
 
@@ -354,9 +362,9 @@ fn spawn_potentials(p: SpawnProbe, q: FluidSample) -> vec2<f32> {
 override WHITE_ADVECT: bool = false;
 
 @compute @workgroup_size(256)
-fn white_spawn(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn white_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     if WHITE_ADVECT && white_dt() > 0.0 {
-        for (var k = gid.x; k < white_state.count; k = k + groups.x * WG) {
+        for (var k = gid.x; k < white_state.count; k = k + dispatched_threads(PARTICLE_SLOT)) {
             advect_white(k);
         }
     }
@@ -425,7 +433,8 @@ fn spawn_white(i: u32) {
         }
     }
 
-    let rate = energy * (K_TA * potential(sums.x, TA_MIN, TA_MAX) + K_WC * potential(sums.y, WC_MIN, WC_MAX));
+    let scaled = sums * per_cell_scale();
+    let rate = energy * (K_TA * potential(scaled.x, TA_MIN, TA_MAX) + K_WC * potential(scaled.y, WC_MIN, WC_MAX));
     var seed = white_hash(bitcast<u32>(particles[i].x.w) ^ white_hash(bitcast<u32>(state.time)));
     let cap = u32(max(MAX_SPAWN, ceil(MAX_SPAWN * dt / WHITE_INTERVAL - 1.0e-3)));
     let n = min(u32(floor(rate * dt + white_random(&seed))), cap);

@@ -17,6 +17,7 @@ struct Params {
     reduction_groups: u32,
     pool: vec4<u32>,
     physics: vec4<f32>,
+    thermal: vec4<f32>,
 }
 
 struct Particle {
@@ -52,6 +53,11 @@ struct State {
 }
 
 const WG: u32 = 256u;
+
+// indirect-call validation can hand num_workgroups another dispatch's count, so strides read the args this dispatch used
+fn dispatched_threads(slot: u32) -> u32 {
+    return dispatch_args[3u * slot] * WG;
+}
 const BIG: f32 = 3.0e38;
 const THETA_MIN: f32 = 0.01;
 
@@ -281,7 +287,6 @@ fn body_velocity_at(b: Body, x: vec3<f32>) -> vec3<f32> {
 
 const S_SCALE: u32 = 0u;
 const S_RZ: u32 = 1u;
-const S_RZ_NEW: u32 = 2u;
 const S_DQ: u32 = 3u;
 const S_ALPHA: u32 = 4u;
 const S_BETA: u32 = 5u;
@@ -293,6 +298,10 @@ const S_COUPLING: u32 = 10u;
 const S_GRADIENT: u32 = 11u;
 const S_FLOOR: u32 = 12u;
 const S_FLOOR_MEAN: u32 = 13u;
+const S_FLOOR_LEVEL: u32 = 14u;
+const S_FLOOR_SET: u32 = 15u;
+const S_FLOOR_RATE: u32 = 120u;
+const S_FLOOR_OFFSET: u32 = 121u;
 const MAX_BODIES: u32 = 8u;
 const S_BODY_RESPONSE: u32 = 16u;
 const S_IMPULSE: u32 = 64u;
@@ -303,7 +312,6 @@ const S_VOLUME: u32 = 116u;
 const S_VOLUME_DIVERGENCE: u32 = 117u;
 const S_BAND_DT: u32 = 118u;
 const S_BAND_SEEDED: u32 = 119u;
-const S_VISCOUS_SCALE: u32 = 120u;
 const S_COUNT: u32 = 128u;
 
 const BRICK: u32 = 8u;
@@ -320,6 +328,84 @@ const NONE: u32 = 0xffffffffu;
 override SPARSE: bool = false;
 override OPEN_FLOOR: bool = false;
 override FLOOR_REACH: f32 = 0.0;
+override PER_CELL: u32 = 8u;
+override BACKTRACE_ORDER: u32 = 4u;
+override QUANTIZED: bool = false;
+override LATE_SURFACE: bool = false;
+override CULL_CROWDED: bool = false;
+
+fn seed_octant(s: u32) -> u32 {
+    if PER_CELL < 8u {
+        let x = s & 1u;
+        let y = (s >> 1u) & 1u;
+        return x | (y << 1u) | ((x ^ y) << 2u);
+    }
+
+    return s;
+}
+
+fn sub_octant(s: u32) -> vec3<f32> {
+    let o = seed_octant(s);
+    return vec3<f32>(f32(o & 1u), f32((o >> 1u) & 1u), f32((o >> 2u) & 1u));
+}
+
+fn per_cell_scale() -> f32 {
+    return 8.0 / f32(PER_CELL);
+}
+
+fn domain_size() -> vec3<f32> {
+    return vec3<f32>(params.dims.xyz) * params.dx;
+}
+
+fn pack_position(x: vec3<f32>, temperature: f32) -> vec2<u32> {
+    let u = clamp(x / domain_size(), vec3<f32>(0.0), vec3<f32>(1.0));
+    let z = pack2x16unorm(vec2<f32>(u.z, 0.0)) | pack2x16float(vec2<f32>(0.0, temperature));
+    return vec2<u32>(pack2x16unorm(u.xy), z);
+}
+
+fn unpack_position(q: vec2<u32>) -> vec3<f32> {
+    return vec3<f32>(unpack2x16unorm(q.x), unpack2x16unorm(q.y).x) * domain_size();
+}
+
+fn motion_index(i: u32) -> u32 {
+    return params.particle_capacity + 3u * i;
+}
+
+fn pack_motion(i: u32, p: Particle) {
+    let m = motion_index(i);
+    packed[m] = vec2<u32>(pack2x16float(p.v.xy), pack2x16float(vec2<f32>(p.v.z, p.c0.x)));
+    packed[m + 1u] = vec2<u32>(pack2x16float(p.c0.yz), pack2x16float(p.c1.xy));
+    packed[m + 2u] = vec2<u32>(pack2x16float(vec2<f32>(p.c1.z, p.c2.x)), pack2x16float(p.c2.yz));
+}
+
+fn unpack_particle(i: u32) -> Particle {
+    let m = motion_index(i);
+    let a = packed[m];
+    let b = packed[m + 1u];
+    let c = packed[m + 2u];
+    let v = unpack2x16float(a.x);
+    let w = unpack2x16float(a.y);
+    let c0 = unpack2x16float(b.x);
+    let c1 = unpack2x16float(b.y);
+    let c2 = unpack2x16float(c.x);
+    let c3 = unpack2x16float(c.y);
+
+    var p: Particle;
+    p.x = vec4<f32>(unpack_position(packed[i]), 0.0);
+    p.v = vec4<f32>(v, w.x, 0.0);
+    p.c0 = vec4<f32>(w.y, c0, unpack2x16float(packed[i].y).y);
+    p.c1 = vec4<f32>(c1, c2.x, 0.0);
+    p.c2 = vec4<f32>(c2.y, c3, 0.0);
+    return p;
+}
+
+fn sorted_position(i: u32) -> vec3<f32> {
+    if QUANTIZED {
+        return unpack_position(packed[i]);
+    }
+
+    return particles[i].x.xyz;
+}
 
 fn brick_dims() -> vec3<u32> {
     return (params.dims.xyz + BRICK - 1u) / BRICK;
