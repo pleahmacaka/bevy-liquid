@@ -22,11 +22,9 @@ import liquid_gpu::shaders::brick_trace::{
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var<uniform> look: WaterLook;
 
-const WATER_STEPS: i32 = 160;
-const SSR_LINEAR_STEPS: u32 = 24u;
-const SSR_BISECTION_STEPS: u32 = 4u;
 const SSR_THICKNESS: f32 = 0.3;
 const SSR_EDGE_FADE: f32 = 0.08;
+const EXIT_REFINEMENTS: i32 = 4;
 
 struct SceneHit {
     hit: bool,
@@ -79,8 +77,8 @@ fn trace_scene(start: vec3<f32>, dir: vec3<f32>) -> SceneHit {
     var march = depth_ray_march_new_from_depth(size);
     depth_ray_march_from_cs(&march, view_transformations::position_world_to_ndc(start));
     depth_ray_march_to_ws_dir(&march, dir);
-    march.linear_steps = SSR_LINEAR_STEPS;
-    march.bisection_steps = SSR_BISECTION_STEPS;
+    march.linear_steps = u32(settings.march.z);
+    march.bisection_steps = u32(settings.march.w);
     march.use_secant = true;
     march.depth_thickness_linear_z = SSR_THICKNESS;
 
@@ -110,28 +108,45 @@ fn reflection(surface: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
     return mix(sky, scene_color(hit.uv), smoothstep(0.0, SSR_EDGE_FADE, min(edge.x, edge.y)));
 }
 
+fn leaves_liquid(p: vec3<f32>) -> bool {
+    let left_box = any(p < box_lo()) || any(p > box_hi());
+    let closed = settings.options.x < 0.5;
+    return behind_scene(p) || sample_field(p) < settings.iso || p.y < box_lo().y || (left_box && closed);
+}
+
 fn refraction(surface: vec3<f32>, dir: vec3<f32>, straight_uv: vec2<f32>) -> Refraction {
-    let step = 0.5 * settings.origin_dx.w;
-    let open_sides = settings.options.x > 0.5;
+    let stride = settings.march.x * settings.origin_dx.w;
+    let count = i32(settings.march.y);
     var p = surface;
     var path = 0.0;
 
-    for (var i = 0; i < WATER_STEPS; i = i + 1) {
-        let next = p + dir * step;
+    for (var i = 0; i < count; i = i + 1) {
+        if leaves_liquid(p + dir * stride) {
+            var inside = 0.0;
+            var outside = stride;
 
-        if behind_scene(next) {
-            return Refraction(scene_color(screen_uv(next)), path + step);
+            for (var k = 0; k < EXIT_REFINEMENTS; k = k + 1) {
+                let mid = 0.5 * (inside + outside);
+
+                if leaves_liquid(p + dir * mid) {
+                    outside = mid;
+                } else {
+                    inside = mid;
+                }
+            }
+
+            let exit = p + dir * outside;
+
+            if behind_scene(exit) {
+                return Refraction(scene_color(screen_uv(exit)), path + outside);
+            }
+
+            let hit = trace_scene(exit, dir);
+            return Refraction(scene_color(select(straight_uv, hit.uv, hit.hit)), path + outside);
         }
 
-        let left_box = any(next < box_lo()) || any(next > box_hi());
-
-        if sample_field(next) < settings.iso || next.y < box_lo().y || (left_box && !open_sides) {
-            let hit = trace_scene(next, dir);
-            return Refraction(scene_color(select(straight_uv, hit.uv, hit.hit)), path);
-        }
-
-        p = next;
-        path = path + step;
+        p = p + dir * stride;
+        path = path + stride;
     }
 
     return Refraction(scene_color(straight_uv), path);

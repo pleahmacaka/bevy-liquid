@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 
 use crate::caustics::CausticsPlugin;
 use crate::plugin::LiquidFrame;
-use crate::solver::{Bind, GpuSolver, Slots};
+use crate::solver::{Bind, GpuSolver, Quality, Slots};
 
 const SHADER_PATH: &str = "embedded://liquid_gpu/shaders/liquid_surface.wesl";
 const MOTION_SHADER_PATH: &str = "embedded://liquid_gpu/shaders/liquid_motion.wesl";
@@ -23,6 +23,9 @@ const SPREAD_PASSES: usize = 5;
 pub const SURFACE_ISO: f32 = 0.5;
 pub const SDF_BAND_CELLS: f32 = 4.0;
 pub const SDF_BRICK: u32 = 8;
+
+const HIGH_MARCH: Vec4 = Vec4::new(0.5, 160.0, 24.0, 4.0);
+const GAME_MARCH: Vec4 = Vec4::new(1.0, 64.0, 12.0, 3.0);
 
 pub struct LiquidMaterialPlugin;
 
@@ -47,6 +50,7 @@ pub struct LiquidSurfaceSettings {
     pub options: Vec4,
     pub iso: f32,
     pub band: f32,
+    pub march: Vec4,
 }
 
 impl LiquidSurfaceSettings {
@@ -57,7 +61,17 @@ impl LiquidSurfaceSettings {
             options: Vec4::ZERO,
             iso: SURFACE_ISO,
             band: SDF_BAND_CELLS * dx,
+            march: HIGH_MARCH,
         }
+    }
+
+    pub fn with_quality(self, quality: Quality) -> Self {
+        let march = match quality {
+            Quality::High => HIGH_MARCH,
+            Quality::Game => GAME_MARCH,
+        };
+
+        Self { march, ..self }
     }
 }
 
@@ -420,6 +434,10 @@ impl SurfaceSdf {
             timestamp_writes: None,
         });
 
+        self.record(&mut pass);
+    }
+
+    pub(crate) fn record(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.seed);
         pass.set_bind_group(0, &self.binds[0], &[]);
         pass.dispatch_workgroups(self.cell_groups, 1, 1);

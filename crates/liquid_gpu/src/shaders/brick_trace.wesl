@@ -4,6 +4,7 @@ struct LiquidSurfaceSettings {
     options: vec4<f32>,
     iso: f32,
     band: f32,
+    march: vec4<f32>,
 }
 
 struct SurfaceHit {
@@ -95,13 +96,36 @@ fn sample_displacement(x: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), m.xyz / m.w, m.w > 1.0e-6);
 }
 
+fn spline_weights(t: f32) -> vec4<f32> {
+    let u = 1.0 - t;
+    return vec4<f32>(u * u * u, 3.0 * t * t * t - 6.0 * t * t + 4.0, -3.0 * t * t * t + 3.0 * t * t + 3.0 * t + 1.0, t * t * t) / 6.0;
+}
+
+fn spline_slopes(t: f32) -> vec4<f32> {
+    let u = 1.0 - t;
+    return vec4<f32>(-u * u, 3.0 * t * t - 4.0 * t, -3.0 * t * t + 2.0 * t + 1.0, t * t) * 0.5;
+}
+
 fn field_gradient(x: vec3<f32>) -> vec3<f32> {
-    let h = 0.5 * settings.origin_dx.w;
-    return vec3<f32>(
-        sample_field(x + vec3<f32>(h, 0.0, 0.0)) - sample_field(x - vec3<f32>(h, 0.0, 0.0)),
-        sample_field(x + vec3<f32>(0.0, h, 0.0)) - sample_field(x - vec3<f32>(0.0, h, 0.0)),
-        sample_field(x + vec3<f32>(0.0, 0.0, h)) - sample_field(x - vec3<f32>(0.0, 0.0, h)),
-    );
+    let k = cube(x);
+    let wx = spline_weights(k.t.x);
+    let wy = spline_weights(k.t.y);
+    let wz = spline_weights(k.t.z);
+    let sx = spline_slopes(k.t.x);
+    let sy = spline_slopes(k.t.y);
+    let sz = spline_slopes(k.t.z);
+    var sum = vec3<f32>(0.0);
+
+    for (var l = 0; l < 4; l = l + 1) {
+        for (var j = 0; j < 4; j = j + 1) {
+            for (var i = 0; i < 4; i = i + 1) {
+                let value = field[cell_index(k.base + vec3<i32>(i, j, l) - 1)];
+                sum = sum + value * vec3<f32>(sx[i] * wy[j] * wz[l], wx[i] * sy[j] * wz[l], wx[i] * wy[j] * sz[l]);
+            }
+        }
+    }
+
+    return sum;
 }
 
 fn surface_normal(x: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {

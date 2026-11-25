@@ -16,7 +16,7 @@ fn particle_phi(n: u32) -> f32 {
             let end = cell_start[row + span];
 
             for (var i = cell_start[row]; i < end; i = i + 1u) {
-                let p = particles[i].x.xyz;
+                let p = sorted_position(i);
                 let d = x - p;
                 let s2 = dot(d, d) / (radius * radius);
 
@@ -65,7 +65,7 @@ fn kernel_row(c: vec3<i32>, cy: i32, cz: i32) -> vec4<f32> {
     let end = cell_start[row + u32(hi - lo) + 1u];
 
     for (var i = cell_start[row]; i < end; i = i + 1u) {
-        let p = particles[i].x.xyz;
+        let p = sorted_position(i);
         let d = x - p;
         let s2 = dot(d, d) / (radius * radius);
 
@@ -155,6 +155,90 @@ fn node_solid(n: u32) {
     nodes[n] = s;
 }
 
+override STATIC_SOLID: bool = false;
+
+fn has_solids() -> bool {
+    return params.body_count > 0u || STATIC_SOLID;
+}
+
+@compute @workgroup_size(256)
+fn solid_nodes_static(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = brick_node(gid.x);
+
+    if n < node_count() {
+        node_solid(n);
+        let p = vec3<u32>(node_coords(n));
+        let d = params.dims.xyz + 1u;
+        nodes[n] = min(nodes[n], static_solid[p.x + d.x * (p.y + d.y * p.z)]);
+    }
+}
+
+fn solid_at(x: vec3<f32>) -> f32 {
+    let g = x * params.inv_dx;
+    let c = clamp(vec3<i32>(floor(g)), vec3<i32>(0), vec3<i32>(params.dims.xyz) - 1);
+    let t = clamp(g - vec3<f32>(c), vec3<f32>(0.0), vec3<f32>(1.0));
+    var s = 0.0;
+
+    for (var corner = 0; corner < 8; corner = corner + 1) {
+        let o = vec3<i32>(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+        let w = select(1.0 - t, t, o == vec3<i32>(1));
+        s = s + w.x * w.y * w.z * nodes[node_index(c + o)];
+    }
+
+    return s;
+}
+
+fn solid_normal(x: vec3<f32>) -> vec3<f32> {
+    let h = 0.5 * params.dx;
+    let g = vec3<f32>(
+        solid_at(x + vec3<f32>(h, 0.0, 0.0)) - solid_at(x - vec3<f32>(h, 0.0, 0.0)),
+        solid_at(x + vec3<f32>(0.0, h, 0.0)) - solid_at(x - vec3<f32>(0.0, h, 0.0)),
+        solid_at(x + vec3<f32>(0.0, 0.0, h)) - solid_at(x - vec3<f32>(0.0, 0.0, h)),
+    );
+    let l = length(g);
+
+    if l > 0.0 {
+        return g / l;
+    }
+
+    return vec3<f32>(0.0);
+}
+
+@compute @workgroup_size(256)
+fn expel_static(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+
+    if i >= state.particle_count {
+        return;
+    }
+
+    let x = particles[i].x.xyz;
+    let s = solid_at(x);
+
+    if s >= params.margin {
+        return;
+    }
+
+    let n = solid_normal(x);
+    var v = particles[i].v.xyz;
+    let inward = dot(v, n);
+
+    if inward < 0.0 {
+        v = v - inward * n;
+    }
+
+    let size = vec3<f32>(params.dims.xyz) * params.dx;
+    var low = vec3<f32>(params.margin);
+
+    if OPEN_FLOOR {
+        low.y = 0.0;
+    }
+
+    let out = clamp(x + n * (params.margin - s), low, size - params.margin);
+    particles[i].x = vec4<f32>(out, particles[i].x.w);
+    particles[i].v = vec4<f32>(v, particles[i].v.w);
+}
+
 fn solid_phi_at_cell(c: vec3<i32>) -> f32 {
     var sum = 0.0;
 
@@ -174,7 +258,7 @@ fn mark_solid_cells(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if params.body_count > 0u && solid_phi_at_cell(cell_coords(n)) < 0.0 {
+    if has_solids() && solid_phi_at_cell(cell_coords(n)) < 0.0 {
         phi[n] = BIG;
     }
 }

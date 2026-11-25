@@ -47,10 +47,10 @@ fn p2g_row(f: vec3<i32>, cy: i32, cz: i32) -> Gathered {
         return sum;
     }
 
-    var p = particles[begin];
+    var p = p2g_particle(begin);
 
     for (var i = begin + 1u; i < end; i = i + 1u) {
-        let next = particles[i];
+        let next = p2g_particle(i);
         p2g_add(&sum, p, node);
         p = next;
     }
@@ -58,6 +58,14 @@ fn p2g_row(f: vec3<i32>, cy: i32, cz: i32) -> Gathered {
     p2g_add(&sum, p, node);
 
     return sum;
+}
+
+fn p2g_particle(i: u32) -> Particle {
+    if QUANTIZED {
+        return unpack_particle(i);
+    }
+
+    return particles[i];
 }
 
 fn node_items() -> u32 {
@@ -418,7 +426,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s2 = interpolate_axis(h, 2u, x);
 
     p.v = vec4<f32>(s0.v, s1.v, s2.v, 0.0);
-    p.c0 = vec4<f32>(s0.c, 0.0);
+    p.c0 = vec4<f32>(s0.c, p.c0.w);
     p.c1 = vec4<f32>(s1.c, 0.0);
     p.c2 = vec4<f32>(s2.c, 0.0);
 
