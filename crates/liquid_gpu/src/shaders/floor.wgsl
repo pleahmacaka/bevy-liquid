@@ -1,4 +1,3 @@
-const FLOOR_SPAWN: u32 = 8u;
 const FLOOR_SAMPLES: i32 = 32;
 
 @compute @workgroup_size(256)
@@ -45,7 +44,19 @@ fn floor_mean(lane: Lane) {
     let total = reduce_workgroup(lane, acc);
 
     if lane.index == 0u {
-        scalars[S_FLOOR_MEAN] = total / f32(cols);
+        let mean = total / f32(cols);
+        scalars[S_FLOOR_MEAN] = mean;
+
+        if state.running == 1u && scalars[S_FLOOR] > 0.0 {
+            if scalars[S_FLOOR_SET] == 0.0 {
+                scalars[S_FLOOR_LEVEL] = mean;
+                scalars[S_FLOOR_RATE] = 0.0;
+                scalars[S_FLOOR_SET] = 1.0;
+            }
+
+            let level = scalars[S_FLOOR_LEVEL];
+            scalars[S_FLOOR_OFFSET] = level - mean - sqrt(level * params.density / scalars[S_FLOOR]) * scalars[S_FLOOR_RATE];
+        }
     }
 }
 
@@ -96,7 +107,7 @@ fn floor_ghost(@builtin(global_invocation_id) gid: vec3<u32>) {
         seen = (sum + tail * scalars[S_FLOOR_MEAN]) / (total + tail);
     }
 
-    l_coef[ghost_slot(col)] = scalars[S_FLOOR] * (seen + 0.5 * dx);
+    l_coef[ghost_slot(col)] = scalars[S_FLOOR] * (seen + scalars[S_FLOOR_OFFSET] + 0.5 * dx);
 }
 
 @compute @workgroup_size(256)
@@ -119,21 +130,21 @@ fn floor_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
     let slot = state.particle_count + t;
 
-    if state.running == 0u || t >= FLOOR_SPAWN * params.dims.x * params.dims.z || slot >= params.particle_capacity {
+    if state.running == 0u || t >= PER_CELL * params.dims.x * params.dims.z || slot >= params.particle_capacity {
         return;
     }
 
-    let col = t / FLOOR_SPAWN;
-    let s = t % FLOOR_SPAWN;
+    let col = t / PER_CELL;
+    let s = t % PER_CELL;
     let cell = vec3<u32>(col % params.dims.x, 0u, col / params.dims.x);
     let seed = (cell.x * 73856093u) ^ (cell.z * 83492791u) ^ (s * 2654435761u) ^ hash_u32(state.ticks);
     let jitter = vec3<f32>(hash_unit(seed), hash_unit(seed ^ 0x9E3779B9u), hash_unit(seed ^ 0x7F4A7C15u));
-    let sub = vec3<f32>(f32(s & 1u), f32((s >> 1u) & 1u), f32((s >> 2u) & 1u));
+    let sub = sub_octant(s);
     let x = (vec3<f32>(cell) + (sub + jitter) * 0.5 - vec3<f32>(0.0, 1.0, 0.0)) * params.dx;
     var p: Particle;
     p.x = vec4<f32>(x, -1.0);
     p.v = vec4<f32>(0.0);
-    p.c0 = vec4<f32>(0.0);
+    p.c0 = vec4<f32>(vec3<f32>(0.0), params.thermal.x);
     p.c1 = vec4<f32>(0.0);
     p.c2 = vec4<f32>(0.0);
     particles[slot] = p;
@@ -145,5 +156,35 @@ fn floor_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if i < state.particle_count && particles[i].x.y < 0.0 {
         particles[i].v.w = 1.0;
+    }
+}
+
+@compute @workgroup_size(256)
+fn floor_close(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = brick_face(gid.x);
+
+    if n < face_total() && face_axis(n) == 1u && face_coords(1u, n).y == 0 {
+        weights[n] = 0.0;
+    }
+}
+
+@compute @workgroup_size(256)
+fn floor_flux(lane: Lane) {
+    let cols = l_columns();
+    var acc = 0.0;
+
+    for (var col = lane.index; col < cols; col = col + WG) {
+        let c = vec3<i32>(i32(col % lv.dims.x), 0, i32(col / lv.dims.x));
+        let open = l_coef[floor_slot(col)];
+
+        if open > 0.0 && l_active[l_index(c)] != 0u {
+            acc = acc + open * velocity[face_index(1u, c)];
+        }
+    }
+
+    let total = reduce_workgroup(lane, acc);
+
+    if lane.index == 0u && state.running == 1u {
+        scalars[S_FLOOR_RATE] = total / (scalars[S_SCALE] * f32(cols));
     }
 }

@@ -1,8 +1,8 @@
-const PARTICLES_PER_CELL: f32 = 8.0;
+override PARTICLES_PER_CELL: f32 = f32(PER_CELL);
 const KERNEL_SHARE: array<f32, 3> = array<f32, 3>(0.15625, 0.6875, 0.15625);
 
 fn near_body(c: vec3<i32>) -> bool {
-    if params.body_count == 0u {
+    if !has_solids() {
         return false;
     }
 
