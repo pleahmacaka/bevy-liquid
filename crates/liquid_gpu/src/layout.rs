@@ -13,14 +13,14 @@ pub const BRICK_LIST_HEAD: u32 = 3;
 pub const BRICK_FACES: u32 = 1728;
 pub const BRICK_NODES: u32 = 729;
 
-pub const FLOOR_SPAWN: u32 = 8;
-
 pub const S_RNORM: usize = 6;
 pub const S_BNORM: usize = 7;
 pub const S_TOLERANCE: usize = 8;
 pub const S_ITERATION: usize = 9;
 pub const S_FLOOR: usize = 12;
 pub const S_FLOOR_MEAN: usize = 13;
+pub const S_FLOOR_LEVEL: usize = 14;
+pub const S_FLOOR_SET: usize = 15;
 pub const S_IMPULSE: usize = 64;
 pub const S_VISCOUS_ITERATIONS: usize = 112;
 pub const S_CAPILLARY_ITERATIONS: usize = 113;
@@ -30,7 +30,6 @@ pub const S_VOLUME: usize = 116;
 pub const S_VOLUME_DIVERGENCE: usize = 117;
 pub const S_BAND_DT: usize = 118;
 pub const S_BAND_SEEDED: usize = 119;
-pub const S_VISCOUS_SCALE: usize = 120;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -53,6 +52,7 @@ pub struct GpuParams {
     pub reduction_groups: u32,
     pub pool: [u32; 4],
     pub physics: [f32; 4],
+    pub thermal: [f32; 4],
 }
 
 #[repr(C)]

@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use bevy::diagnostic::{Diagnostic, DiagnosticPath, Diagnostics, RegisterDiagnostic};
 use bevy::prelude::*;
 
+use crate::emitter::GpuEmissionState;
 use crate::layout::GpuState;
+use crate::render::SurfaceSdf;
 use crate::solver::{GpuSolver, Profiler, Section};
 
 const RING: usize = 4;
@@ -20,6 +22,7 @@ pub const PARTICLES: DiagnosticPath = DiagnosticPath::const_new("liquid/particle
 pub const SUBSTEPS: DiagnosticPath = DiagnosticPath::const_new("liquid/substeps");
 pub const ENCODE_TIME: DiagnosticPath = DiagnosticPath::const_new("liquid/encode");
 pub const MAX_SPEED: DiagnosticPath = DiagnosticPath::const_new("liquid/max_speed");
+pub const EMITTED: DiagnosticPath = DiagnosticPath::const_new("liquid/emitted");
 pub const SECTIONS: [DiagnosticPath; 10] = [
     DiagnosticPath::const_new("liquid/plan"),
     DiagnosticPath::const_new("liquid/sort"),
@@ -38,6 +41,7 @@ pub struct Sample {
     pub particles: u32,
     pub substeps: u32,
     pub max_speed: f32,
+    pub emitted: u32,
     pub wanted: u32,
     pub encode_ms: f32,
 }
@@ -79,6 +83,7 @@ pub(crate) fn build(app: &mut App) -> DiagnosticsRing {
 
     app.register_diagnostic(Diagnostic::new(PARTICLES))
         .register_diagnostic(Diagnostic::new(SUBSTEPS))
+        .register_diagnostic(Diagnostic::new(EMITTED))
         .register_diagnostic(Diagnostic::new(MAX_SPEED).with_suffix(" m/s"))
         .insert_resource(DiagnosticsInbox(Mutex::new(receiver)))
         .add_systems(PreUpdate, record);
@@ -108,6 +113,7 @@ fn record(inbox: Res<DiagnosticsInbox>, mut diagnostics: Diagnostics) {
 
         diagnostics.add_measurement(&PARTICLES, || sample.particles as f64);
         diagnostics.add_measurement(&SUBSTEPS, || sample.substeps as f64);
+        diagnostics.add_measurement(&EMITTED, || sample.emitted as f64);
         diagnostics.add_measurement(&MAX_SPEED, || sample.max_speed as f64);
         diagnostics.add_measurement(&ENCODE_TIME, || sample.encode_ms as f64);
     }
@@ -120,9 +126,10 @@ impl DiagnosticsRing {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         solver: &GpuSolver,
+        sdf: Option<&SurfaceSdf>,
     ) {
         let Ok(mut guard) = self.slots.lock() else {
-            solver.encode_frame_within(encoder, None, self.budget.load(Ordering::Acquire));
+            solver.encode_frame_with(encoder, None, self.budget.load(Ordering::Acquire), sdf);
             return;
         };
         let (substeps, slots) = &mut *guard;
@@ -142,13 +149,13 @@ impl DiagnosticsRing {
 
         let budget = self.budget.load(Ordering::Acquire);
         let Some(slot) = slots.iter_mut().find(|s| s.status.load(Ordering::Acquire) == FREE) else {
-            solver.encode_frame_within(encoder, None, budget);
+            solver.encode_frame_with(encoder, None, budget, sdf);
             return;
         };
 
         let profiler = slot.profiler.as_ref().filter(|_| self.frames.fetch_add(1, Ordering::AcqRel).is_multiple_of(PROFILE_PERIOD));
         let start = std::time::Instant::now();
-        solver.encode_frame_within(encoder, profiler, budget);
+        solver.encode_frame_with(encoder, profiler, budget, sdf);
         slot.encode_ms = start.elapsed().as_secs_f32() * 1000.0;
         slot.encoded = budget;
         slot.profiled = profiler.is_some();
@@ -158,6 +165,7 @@ impl DiagnosticsRing {
         }
 
         encoder.copy_buffer_to_buffer(&solver.buffers.state, 0, &slot.state, 0, state_bytes());
+        encoder.copy_buffer_to_buffer(solver.emission_state(), 0, &slot.state, state_bytes(), emission_bytes());
         slot.status.store(ENCODED, Ordering::Release);
     }
 
@@ -204,6 +212,10 @@ fn state_bytes() -> u64 {
     std::mem::size_of::<GpuState>() as u64
 }
 
+fn emission_bytes() -> u64 {
+    std::mem::size_of::<GpuEmissionState>() as u64
+}
+
 fn new_slot(device: &wgpu::Device, queue: &wgpu::Queue, substeps: u32) -> Slot {
     let profiler = device
         .features()
@@ -215,7 +227,7 @@ fn new_slot(device: &wgpu::Device, queue: &wgpu::Queue, substeps: u32) -> Slot {
         profiled: false,
         state: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("liquid diagnostics state"),
-            size: state_bytes(),
+            size: state_bytes() + emission_bytes(),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -226,9 +238,11 @@ fn new_slot(device: &wgpu::Device, queue: &wgpu::Queue, substeps: u32) -> Slot {
 }
 
 fn read(slot: &Slot) -> Option<Sample> {
-    let state: GpuState = {
+    let (state, emission): (GpuState, GpuEmissionState) = {
         let view = slot.state.get_mapped_range(..).ok()?;
-        *bytemuck::from_bytes(&view[..state_bytes() as usize])
+        let (state, emission) = view.split_at(state_bytes() as usize);
+
+        (*bytemuck::from_bytes(state), bytemuck::pod_read_unaligned(emission))
     };
     let sections = match slot.profiler.as_ref().filter(|_| slot.profiled) {
         Some(profiler) => {
@@ -243,6 +257,7 @@ fn read(slot: &Slot) -> Option<Sample> {
         particles: state.particle_count,
         substeps: state.substeps,
         max_speed: f32::from_bits(state.vmax_bits),
+        emitted: emission.total,
         wanted: budget_for(&state),
         encode_ms: slot.encode_ms,
     })
