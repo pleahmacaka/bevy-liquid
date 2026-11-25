@@ -1,5 +1,7 @@
+pub mod adhesion;
 pub mod exec;
 pub mod extrapolate;
+pub mod gas;
 pub mod grid;
 pub mod idp;
 pub mod kernel;
