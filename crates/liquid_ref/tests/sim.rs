@@ -574,3 +574,36 @@ fn tenth_density_sphere_rises_and_floats_stably() {
     assert!((offset - expected).abs() < 0.15);
     assert!(later_swing < earlier_swing);
 }
+
+#[test]
+fn open_floor_returns_to_the_reservoir_level() {
+    let dx = 1.0 / 32.0;
+    let depth = 10.0 * dx;
+    let dims = UVec3::new(16, 16, 4);
+    let params = Params { open_floor: Some(3.0), tolerance: 1e-6, ..Params::default() };
+    let mut sim = tank(dims, dx, depth, params);
+    let area = sim.grid.size().x * sim.grid.size().z;
+    let seeded = sim.particles.len();
+    let rest = sim.liquid_volume() / area;
+
+    sim.particles.iter_mut().for_each(|p| p.v.y = 0.2);
+
+    let rise: Vec<f64> = (0..150)
+        .map(|_| {
+            sim.substep(1.0 / 60.0);
+            sim.liquid_volume() / area - rest
+        })
+        .collect();
+    let peak = rise.iter().copied().fold(0.0, f64::max);
+    let settled = ((0..rise.len()).rev().take_while(|&f| rise[f].abs() < 0.01 * depth).last().unwrap_or(rise.len()) + 1) as f64 / 60.0;
+    let change = sim.particles.len() as f64 / seeded as f64 - 1.0;
+
+    println!(
+        "pool kicked up at 0.2 m/s over an open floor: mean level peaks {peak:.4} m above rest and stays within 1 % of the depth from {settled:.2} s, count change {change:+.4} at 2.5 s"
+    );
+
+    assert!(params.density_projection);
+    assert!(peak > 0.01 && peak < 0.025);
+    assert!(settled < 1.0);
+    assert!(change.abs() < 0.02);
+}

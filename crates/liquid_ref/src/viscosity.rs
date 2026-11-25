@@ -37,6 +37,24 @@ impl Fractions {
             }),
         }
     }
+
+    pub fn blend(&self, other: &Fractions, ratio: f64) -> Self {
+        let mix = |a: &Field3, b: &Field3| Field3 {
+            dims: a.dims,
+            data: a
+                .data
+                .iter()
+                .zip(&b.data)
+                .map(|(x, y)| x + ratio * y)
+                .collect(),
+        };
+
+        Self {
+            cells: mix(&self.cells, &other.cells),
+            faces: self.faces.clone(),
+            edges: from_fn(|e| mix(&self.edges[e], &other.edges[e])),
+        }
+    }
 }
 
 pub fn edge_dims(grid: &Grid, a: usize, b: usize) -> UVec3 {

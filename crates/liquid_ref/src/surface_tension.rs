@@ -11,6 +11,12 @@ pub const LEVEL_SET_SMOOTHING_PASSES: usize = 8;
 
 pub const DAMPING_HALF_WIDTH_CELLS: f64 = 1.5;
 
+pub const JUMP_SMOOTHING_PASSES: usize = 2;
+
+pub const RESOLVED_CURVATURE: f64 = 0.45;
+
+pub const THIN_CURVATURE: f64 = 0.6;
+
 pub fn capillary_dt(grid: &Grid, density: f64, sigma: f64) -> f64 {
     (density * grid.dx.powi(3) / (2.0 * std::f64::consts::PI * sigma)).sqrt()
 }
@@ -112,53 +118,121 @@ pub struct PressureJump<'a> {
 
     pub kappa: &'a Field3,
 
+    pub smooth: Vec<f64>,
+
     pub sigma: f64,
+
+    pub dx: f64,
 }
 
-impl PressureJump<'_> {
-    pub fn theta(&self, liquid: usize, air: usize) -> Option<f64> {
-        let level = self.level;
-        let ghost = level.active[liquid] && !level.active[air] && level.phi[air] >= 0.0;
+fn theta(level: &Level, liquid: usize, air: usize) -> Option<f64> {
+    let ghost = level.active[liquid] && !level.active[air] && level.phi[air] >= 0.0;
 
-        ghost.then(|| (level.phi[liquid] / (level.phi[liquid] - level.phi[air])).max(THETA_MIN))
+    ghost.then(|| (level.phi[liquid] / (level.phi[liquid] - level.phi[air])).max(THETA_MIN))
+}
+
+struct Cut {
+    air: usize,
+
+    theta: f64,
+
+    coef: f64,
+}
+
+fn cuts(level: &Level, n: usize) -> impl Iterator<Item = Cut> + '_ {
+    let c = level.coords(n);
+
+    (0..3)
+        .flat_map(|a| [(a, -1), (a, 1)])
+        .filter_map(move |(a, side)| {
+            let air = level.neighbor(c, a, side)?;
+            let coef = if side > 0 {
+                level.coef[a][n]
+            } else {
+                level.coef[a][air]
+            };
+
+            if coef <= 0.0 {
+                return None;
+            }
+
+            theta(level, n, air).map(|theta| Cut { air, theta, coef })
+        })
+}
+
+fn interface_curvature(level: &Level, kappa: &Field3, n: usize) -> Option<f64> {
+    let k = &kappa.data;
+    let (sum, count) = cuts(level, n).fold((0.0, 0.0), |(sum, count), cut| {
+        (sum + (1.0 - cut.theta) * k[n] + cut.theta * k[cut.air], count + 1.0)
+    });
+
+    (count > 0.0).then(|| sum / count)
+}
+
+fn neighborhood_mean(level: &Level, values: &[Option<f64>], n: usize) -> Option<f64> {
+    if !level.active[n] {
+        return None;
+    }
+
+    let c = level.coords(n).as_ivec3();
+    let dims = level.dims.as_ivec3();
+    let mut sum = 0.0;
+    let mut count = 0.0;
+
+    for o in 0..27 {
+        let p = c + IVec3::new(o % 3 - 1, (o / 3) % 3 - 1, o / 9 - 1);
+
+        if p.cmplt(IVec3::ZERO).any() || p.cmpge(dims).any() {
+            continue;
+        }
+
+        if let Some(v) = values[level.index(p.as_uvec3())] {
+            sum += v;
+            count += 1.0;
+        }
+    }
+
+    (count > 0.0).then(|| sum / count)
+}
+
+impl<'a> PressureJump<'a> {
+    pub fn new(grid: &Grid, level: &'a Level, kappa: &'a Field3, sigma: f64) -> Self {
+        let mut values: Vec<Option<f64>> =
+            exec::map(level.len(), |n| interface_curvature(level, kappa, n));
+
+        for _ in 0..JUMP_SMOOTHING_PASSES {
+            values = exec::map(level.len(), |n| neighborhood_mean(level, &values, n));
+        }
+
+        Self {
+            level,
+            kappa,
+            smooth: values.into_iter().map(|v| v.unwrap_or(0.0)).collect(),
+            sigma,
+            dx: grid.dx,
+        }
+    }
+
+    pub fn theta(&self, liquid: usize, air: usize) -> Option<f64> {
+        theta(self.level, liquid, air)
     }
 
     pub fn interface_pressure(&self, liquid: usize, air: usize, theta: f64) -> f64 {
         let k = &self.kappa.data;
+        let smooth = self.smooth[liquid];
+        let t = ((smooth.abs() * self.dx - RESOLVED_CURVATURE)
+            / (THIN_CURVATURE - RESOLVED_CURVATURE))
+            .clamp(0.0, 1.0);
+        let thin = t * t * (3.0 - 2.0 * t);
+        let sharp = (1.0 - theta) * k[liquid] + theta * k[air];
 
-        self.sigma * ((1.0 - theta) * k[liquid] + theta * k[air])
+        self.sigma * (sharp + thin * (smooth - sharp))
     }
 
     pub fn add_to_rhs(&self, rhs: &mut [f64]) {
-        let level = self.level;
-
         for (n, slot) in rhs.iter_mut().enumerate() {
-            if !level.active[n] {
-                continue;
-            }
-
-            let c = level.coords(n);
-
-            for a in 0..3 {
-                for side in [-1, 1] {
-                    let Some(m) = level.neighbor(c, a, side) else {
-                        continue;
-                    };
-
-                    let k = if side > 0 {
-                        level.coef[a][n]
-                    } else {
-                        level.coef[a][m]
-                    };
-
-                    if k <= 0.0 {
-                        continue;
-                    }
-
-                    if let Some(theta) = self.theta(n, m) {
-                        *slot += k / theta * self.interface_pressure(n, m, theta);
-                    }
-                }
+            for cut in cuts(self.level, n) {
+                *slot += cut.coef / cut.theta * self.interface_pressure(n, cut.air, cut.theta);
             }
         }
     }

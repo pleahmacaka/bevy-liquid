@@ -1,7 +1,8 @@
 use glam::{DVec3, UVec3};
 use liquid_ref::grid::{Grid, MacField};
 use liquid_ref::levelset::{face_weights, solid_phi_nodes};
-use liquid_ref::scene::dam_break;
+use liquid_ref::particles::{Particle, seed_box};
+use liquid_ref::scene::{SEED_JITTER, dam_break};
 use liquid_ref::sim::{Params, Simulation};
 use liquid_ref::viscosity::{Fractions, ViscositySolve};
 
@@ -10,6 +11,10 @@ const LAMB_ROOT: f64 = 5.763_459_196_894_55;
 const RADIUS: f64 = 0.1;
 
 const NU: f64 = 0.01;
+
+const THREAD_RADIUS_CELLS: f64 = 1.5;
+
+const THREAD_HALF_CELLS: f64 = 10.0;
 
 struct Ball {
     grid: Grid,
@@ -31,6 +36,28 @@ impl Ball {
 
         for i in 0..phi.data.len() {
             phi.data[i] = (grid.cell_center(phi.coords(i)) - center).length() - RADIUS;
+        }
+
+        let weights = face_weights(&grid, &solid_phi_nodes(&grid, &[]));
+        let fractions = Fractions::new(&grid, &phi);
+
+        Self {
+            grid,
+            fractions,
+            weights,
+            center,
+        }
+    }
+
+    fn thread() -> Self {
+        let dx = RADIUS / 5.0;
+        let grid = Grid::new(UVec3::new(12, 32, 12), dx);
+        let center = grid.size() * 0.5 + DVec3::new(0.3, 0.0, 0.2) * dx;
+
+        let mut phi = grid.cells();
+
+        for i in 0..phi.data.len() {
+            phi.data[i] = thread_distance(grid.cell_center(phi.coords(i)) - center, dx);
         }
 
         let weights = face_weights(&grid, &solid_phi_nodes(&grid, &[]));
@@ -170,6 +197,83 @@ fn rigid_rotation_survives_strong_viscosity() {
     println!("angular momentum kept after 5 solves at dt = 50 dx^2/nu: {ratio:.9}");
 
     assert!((ratio - 1.0).abs() < 1e-6);
+}
+
+fn thread_distance(r: DVec3, dx: f64) -> f64 {
+    let along = r.y.clamp(-THREAD_HALF_CELLS * dx, THREAD_HALF_CELLS * dx);
+
+    (r - DVec3::Y * along).length() - THREAD_RADIUS_CELLS * dx
+}
+
+#[test]
+fn thin_thread_keeps_rigid_motion_through_strong_viscosity() {
+    let thread = Ball::thread();
+    let dt = 50.0 * thread.grid.dx * thread.grid.dx / NU;
+
+    let fall = thread.field(|_| DVec3::new(0.3, -1.0, 0.2));
+    let mut u = fall.clone();
+    thread.diffuse(&mut u, dt);
+
+    let mut change = MacField::new(&thread.grid);
+
+    for axis in 0..3 {
+        for (n, c) in change.axes[axis].data.iter_mut().enumerate() {
+            if thread.fractions.faces.axes[axis].data[n] > 0.0 {
+                *c = u.axes[axis].data[n] - fall.axes[axis].data[n];
+            }
+        }
+    }
+
+    let drift = change.max_abs();
+    let mut u = thread.field(|r| DVec3::new(-r.y, r.x, 0.0));
+    let l0 = thread.angular_momentum(&u);
+
+    for _ in 0..5 {
+        thread.diffuse(&mut u, dt);
+    }
+
+    let ratio = thread.angular_momentum(&u) / l0;
+
+    println!(
+        "thread of radius {THREAD_RADIUS_CELLS} cells at dt = 50 dx^2/nu: translation changed by {drift:.3e} m/s, angular momentum kept after 5 solves {ratio:.9}"
+    );
+
+    assert!(drift < 1e-9);
+    assert!((ratio - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn free_falling_viscous_thread_gains_no_lateral_momentum() {
+    let dx = 0.02;
+    let grid = Grid::new(UVec3::new(12, 36, 12), dx);
+    let center = grid.size() * 0.5 + DVec3::new(0.3, 0.0, 0.2) * dx;
+    let particles: Vec<Particle> = seed_box(&grid, DVec3::ZERO, grid.size(), SEED_JITTER)
+        .into_iter()
+        .filter(|p| thread_distance(p.x - center, dx) < 0.0)
+        .collect();
+    let count = particles.len() as f64;
+    let params = Params {
+        density: 1420.0,
+        viscosity: 1500.0,
+        ..Params::default()
+    };
+    let mut sim = Simulation::new(grid, params, particles, Vec::new());
+
+    for _ in 0..10 {
+        sim.substep(1.0 / 120.0);
+    }
+
+    let mean = sim.particles.iter().map(|p| p.v).sum::<DVec3>() / count;
+    let lateral = (sim.particles.iter().map(|p| p.v.x * p.v.x + p.v.z * p.v.z).sum::<f64>() / count).sqrt();
+
+    println!(
+        "thread of {count} particles after 10 substeps: fall {:.4} m/s, mean lateral ({:.2e}, {:.2e}) m/s, lateral rms {lateral:.2e} m/s",
+        -mean.y, mean.x, mean.z
+    );
+
+    assert!((mean.y + 9.81 * 10.0 / 120.0).abs() < 1e-9);
+    assert!(mean.x.abs() < 1e-12 && mean.z.abs() < 1e-12);
+    assert!(lateral < 1e-12);
 }
 
 fn front_position(sim: &Simulation, height: f64) -> f64 {

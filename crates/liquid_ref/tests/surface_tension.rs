@@ -241,3 +241,94 @@ fn oscillating_droplet_follows_rayleigh_period() {
     assert!(errors[1] < errors[0]);
     assert!(errors[1] < 0.05);
 }
+
+const HONEY_DX: f64 = 0.02;
+
+const SUBCELL_OFFSETS: [DVec3; 3] = [
+    DVec3::ZERO,
+    DVec3::new(0.3, 0.25, 0.2),
+    DVec3::new(-0.4, -0.15, 0.1),
+];
+
+fn falling_body(thread: bool, radius_cells: f64, offset: DVec3, viscosity: f64) -> Simulation {
+    let grid = Grid::new(UVec3::new(24, 72, 24), HONEY_DX);
+    let size = grid.size();
+    let radius = radius_cells * HONEY_DX;
+    let half = 10.0 * HONEY_DX;
+    let center = DVec3::new(0.5 * size.x, size.y - 6.0 * HONEY_DX - half, 0.5 * size.z)
+        + offset * HONEY_DX;
+    let particles: Vec<Particle> = seed_box(&grid, DVec3::ZERO, size, SEED_JITTER)
+        .into_iter()
+        .filter(|p| {
+            let d = p.x - center;
+
+            if thread {
+                d.y.abs() < half && d.x.hypot(d.z) < radius
+            } else {
+                d.length() < radius
+            }
+        })
+        .collect();
+    let params = Params {
+        density: 1420.0,
+        viscosity,
+        surface_tension: 4.0,
+        cfl: 2.5,
+        max_iterations: 400,
+        ..Params::default()
+    };
+
+    Simulation::new(grid, params, particles, Vec::new())
+}
+
+fn lateral_speed(mut sim: Simulation) -> f64 {
+    for _ in 0..20 {
+        sim.advance(1.0 / 60.0);
+    }
+
+    let mean = sim.particles.iter().map(|p| p.v).sum::<DVec3>() / sim.particles.len() as f64;
+
+    mean.x.hypot(mean.z)
+}
+
+fn worst_lateral_speed(thread: bool, radius_cells: f64, viscosity: f64) -> f64 {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = SUBCELL_OFFSETS
+            .into_iter()
+            .map(|o| s.spawn(move || lateral_speed(falling_body(thread, radius_cells, o, viscosity))))
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| unreachable!()))
+            .fold(0.0, f64::max)
+    })
+}
+
+#[test]
+fn falling_thread_keeps_its_lateral_momentum() {
+    for viscosity in [1500.0, 0.0] {
+        for radius in [0.75, 1.0] {
+            let speed = worst_lateral_speed(true, radius, viscosity);
+
+            println!(
+                "thread of radius {radius} cells, {viscosity} Pa s, 20 frames of free fall: worst mean lateral speed {speed:.3e} m/s over 3 sub-cell offsets"
+            );
+
+            assert!(speed < 3e-3);
+        }
+    }
+}
+
+#[test]
+fn falling_ball_keeps_its_lateral_momentum() {
+    for viscosity in [1500.0, 0.0] {
+        let speed = worst_lateral_speed(false, 1.5, viscosity);
+
+        println!(
+            "ball of radius 1.5 cells, {viscosity} Pa s, 20 frames of free fall: worst mean lateral speed {speed:.3e} m/s over 3 sub-cell offsets"
+        );
+
+        assert!(speed < 1e-3);
+    }
+}

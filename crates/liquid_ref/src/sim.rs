@@ -1,5 +1,6 @@
 use glam::{DVec3, UVec3};
 
+use crate::adhesion::adhere;
 use crate::extrapolate::extrapolate_mac;
 use crate::grid::{Field3, Grid, MacField};
 use crate::idp::{density_error, displace, fluid_fraction, particle_density, solve_displacement};
@@ -14,7 +15,7 @@ use crate::narrow_band::{
 use crate::particles::{CellIndex, Particle, hash_u32, seed_cell};
 use crate::pressure::{
     Level, Multigrid, PressureSystem, SolveStats, apply_gradient, body_couplings, divergence_rhs,
-    floor_ghost, pcg,
+    floor_ghost, floor_surface, pcg,
 };
 use crate::rigid::{RigidBody, Shape, apply_inverse_mass};
 use crate::surface_tension::{
@@ -53,6 +54,8 @@ pub struct Params {
 
     pub surface_tension: f64,
 
+    pub adhesion: f64,
+
     pub boundary_width: u32,
 
     pub boundary_sweeps: usize,
@@ -81,6 +84,7 @@ impl Default for Params {
             narrow_band: None,
             viscosity: 0.0,
             surface_tension: 0.0,
+            adhesion: 0.0,
             boundary_width: 0,
             boundary_sweeps: 0,
             block_smoothing: false,
@@ -107,6 +111,13 @@ pub struct StepReport {
     pub unknowns: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reservoir {
+    pub level: f64,
+
+    pub rate: f64,
+}
+
 pub struct Simulation {
     pub grid: Grid,
 
@@ -129,6 +140,8 @@ pub struct Simulation {
     pub volume_control: Option<VolumeControl>,
 
     pub ticks: u32,
+
+    pub reservoir: Option<Reservoir>,
 }
 
 impl Simulation {
@@ -150,6 +163,7 @@ impl Simulation {
             report: StepReport::default(),
             volume_control: None,
             ticks: 0,
+            reservoir: None,
         };
 
         if params.narrow_band.is_some() {
@@ -164,7 +178,7 @@ impl Simulation {
 
     pub fn refresh_phi(&mut self) {
         let index = CellIndex::build(&self.grid, &self.particles);
-        self.phi = self.geometry(&index).0;
+        self.phi = self.geometry(&index, self.params.open_floor.is_some()).0;
     }
 
     pub fn cfl_dt(&self) -> f64 {
@@ -224,7 +238,7 @@ impl Simulation {
 
         let index = CellIndex::build(&grid, &self.particles);
         let transfer = p2g(&grid, &self.particles, &index);
-        let (phi, weights, owners, _) = self.geometry(&index);
+        let (phi, weights, owners, _) = self.geometry(&index, p.open_floor.is_some());
         let (mut velocity, mut valid) = self.transferred_velocity(transfer, &phi);
 
         extrapolate_mac(&mut velocity, &mut valid, 2);
@@ -238,13 +252,23 @@ impl Simulation {
             b.velocity += p.gravity * dt;
         }
 
+        if p.adhesion > 0.0 {
+            adhere(&grid, &self.bodies, &weights, &mut velocity, p.adhesion, dt);
+        }
+
         let solid = solid_velocity(&grid, &self.bodies, &owners);
 
         let scale = dt / (p.density * grid.dx * grid.dx);
         let mut level = Level::from_fine(&grid, &phi, &weights, scale);
 
         if let Some(reach) = p.open_floor {
-            level.ghost = floor_ghost(&level, grid.dx, reach, -p.density * p.gravity.y);
+            let weight = -p.density * p.gravity.y;
+            let surface = floor_surface(&level, grid.dx);
+            let mean = surface.iter().sum::<f64>() / surface.len() as f64;
+            let offset = self.reservoir_offset(mean);
+
+            level.ghost = floor_ghost(&level, grid.dx, reach, weight);
+            level.ghost.iter_mut().for_each(|g| *g += weight * offset);
         }
 
         let multigrid = Multigrid::new(level, p.multigrid_min_dim)
@@ -269,11 +293,9 @@ impl Simulation {
 
         let distance = (p.surface_tension > 0.0).then(|| redistance(&phi, grid.dx));
         let kappa = distance.as_ref().map(|d| curvature(&grid, d));
-        let jump = kappa.as_ref().map(|kappa| PressureJump {
-            level: &multigrid.levels[0],
-            kappa,
-            sigma: p.surface_tension,
-        });
+        let jump = kappa
+            .as_ref()
+            .map(|kappa| PressureJump::new(&grid, &multigrid.levels[0], kappa, p.surface_tension));
 
         if let Some(jump) = &jump {
             jump.add_to_rhs(&mut rhs);
@@ -326,27 +348,35 @@ impl Simulation {
             blend_partial(&mut velocity, &mut valid, &weights, &solid_after);
         }
 
+        self.record_floor_flux(&multigrid.levels[0], &velocity, scale);
+
         extrapolate_mac(&mut velocity, &mut valid, p.extrapolation_layers);
         constrain(&mut velocity, &weights, &solid_after);
 
         let boundary = (&weights, &solid_after);
-        let capillary = distance.as_ref().map(|d| {
-            let damping = capillary_damping(&grid, d);
+        let damping = distance.as_ref().map(|d| {
             let nu = capillary_viscosity(&grid, p.density, p.surface_tension, dt);
 
-            self.diffuse(&damping, nu, boundary, &mut velocity, dt)
+            (capillary_damping(&grid, d), nu)
         });
-        let viscosity = (p.viscosity > 0.0).then(|| {
+        let (capillary, viscosity) = if p.viscosity > 0.0 {
+            let nu = p.viscosity / p.density;
             let liquid = Fractions::new(&grid, &phi);
+            let stress = match &damping {
+                Some((damping, capillary)) => liquid.blend(damping, capillary / nu),
+                None => liquid,
+            };
 
-            self.diffuse(
-                &liquid,
-                p.viscosity / p.density,
-                boundary,
-                &mut velocity,
-                dt,
+            (
+                None,
+                Some(self.diffuse(&stress, nu, boundary, &mut velocity, dt)),
             )
-        });
+        } else {
+            let capillary = damping
+                .map(|(damping, nu)| self.diffuse(&damping, nu, boundary, &mut velocity, dt));
+
+            (capillary, None)
+        };
 
         let mut divergence = divergence_rhs(
             &grid,
@@ -489,7 +519,7 @@ impl Simulation {
         stats
     }
 
-    fn geometry(&self, index: &CellIndex) -> (Field3, MacField, [Vec<i32>; 3], Field3) {
+    fn geometry(&self, index: &CellIndex, open_floor: bool) -> (Field3, MacField, [Vec<i32>; 3], Field3) {
         let mut phi = self.liquid_surface(index);
         let nodes = solid_phi_nodes(&self.grid, &self.bodies);
 
@@ -497,7 +527,7 @@ impl Simulation {
 
         let mut weights = face_weights(&self.grid, &nodes);
 
-        if self.params.open_floor.is_some() {
+        if open_floor {
             open_floor_weights(&self.grid, &nodes, &mut weights);
         }
 
@@ -523,7 +553,7 @@ impl Simulation {
     fn project_density(&mut self) -> SolveStats {
         let grid = self.grid;
         let index = CellIndex::build(&grid, &self.particles);
-        let (phi, weights, _, nodes) = self.geometry(&index);
+        let (phi, weights, _, nodes) = self.geometry(&index, false);
         let level = Level::from_fine(&grid, &phi, &weights, 1.0 / (grid.dx * grid.dx));
         let fluid = fluid_fraction(&grid, &level, &nodes);
         let density = particle_density(&grid, &level, &self.particles, &index, &fluid);
@@ -543,10 +573,38 @@ impl Simulation {
         );
 
         displace(&grid, &projection.displacement, &mut self.particles);
-        self.cull_floor();
         self.keep_particles_inside();
 
         projection.stats
+    }
+
+    fn reservoir_offset(&mut self, mean: f64) -> f64 {
+        let gravity = -self.params.gravity.y;
+
+        if gravity <= 0.0 {
+            return 0.0;
+        }
+
+        let Reservoir { level, rate } = *self.reservoir.get_or_insert(Reservoir { level: mean, rate: 0.0 });
+
+        level - mean - (level / gravity).sqrt() * rate
+    }
+
+    fn record_floor_flux(&mut self, level: &Level, velocity: &MacField, scale: f64) {
+        let Some(reservoir) = &mut self.reservoir else {
+            return;
+        };
+
+        let flux: f64 = (0..level.columns())
+            .filter(|&col| level.floor[col] > 0.0 && level.active[level.floor_cell(col)])
+            .map(|col| {
+                let c = level.coords(level.floor_cell(col));
+
+                level.floor[col] * velocity.axes[1].get(c.x, 0, c.z)
+            })
+            .sum();
+
+        reservoir.rate = flux / (scale * level.columns() as f64);
     }
 
     fn cull_floor(&mut self) {
