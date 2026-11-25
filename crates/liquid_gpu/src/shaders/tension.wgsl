@@ -133,8 +133,125 @@ fn ghost_theta(liquid: u32, air: u32) -> f32 {
     return -1.0;
 }
 
+fn cut_curvature(n: u32) -> f32 {
+    let c = cell_coords(n);
+    let len = l_len();
+    var sum = 0.0;
+    var count = 0.0;
+
+    for (var a = 0u; a < 3u; a = a + 1u) {
+        for (var side = -1; side <= 1; side = side + 2) {
+            let p = bump(c, a, side);
+
+            if !in_cells(p) {
+                continue;
+            }
+
+            let m = cell_index(p);
+            var k = l_coef[a * len + m];
+
+            if side > 0 {
+                k = l_coef[a * len + n];
+            }
+
+            if k <= 0.0 {
+                continue;
+            }
+
+            let theta = ghost_theta(n, m);
+
+            if theta > 0.0 {
+                sum = sum + ((1.0 - theta) * kappa[n] + theta * kappa[m]);
+                count = count + 1.0;
+            }
+        }
+    }
+
+    if count > 0.0 {
+        return sum / count;
+    }
+
+    return BIG;
+}
+
+@compute @workgroup_size(256)
+fn jump_seed(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = brick_cell(gid.x);
+
+    if n >= cell_count() {
+        return;
+    }
+
+    sweep_a[n] = cut_curvature(n);
+}
+
+override SMOOTH: u32 = 0u;
+
+fn smooth_read(n: u32) -> f32 {
+    if SMOOTH == 0u {
+        return sweep_a[n];
+    }
+
+    return sweep_b[n];
+}
+
+fn neighborhood_mean(n: u32) -> f32 {
+    let c = cell_coords(n);
+    var sum = 0.0;
+    var count = 0.0;
+
+    for (var o = 0; o < 27; o = o + 1) {
+        let p = c + vec3<i32>(o % 3, (o / 3) % 3, o / 9) - 1;
+
+        if !in_cells(p) || (SPARSE && !brick_live(p)) {
+            continue;
+        }
+
+        let v = smooth_read(cell_index(p));
+
+        if v < 0.5 * BIG {
+            sum = sum + v;
+            count = count + 1.0;
+        }
+    }
+
+    if count > 0.0 {
+        return sum / count;
+    }
+
+    return BIG;
+}
+
+@compute @workgroup_size(256)
+fn jump_smooth(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = brick_cell(gid.x);
+
+    if n >= cell_count() {
+        return;
+    }
+
+    var mean = BIG;
+
+    if l_active[n] != 0u {
+        mean = neighborhood_mean(n);
+    }
+
+    if SMOOTH == 0u {
+        sweep_b[n] = mean;
+    } else {
+        sweep_a[n] = select(mean, 0.0, mean > 0.5 * BIG);
+    }
+}
+
+const RESOLVED_CURVATURE: f32 = 0.45;
+const THIN_CURVATURE: f32 = 0.6;
+
 fn interface_pressure(liquid: u32, air: u32, theta: f32) -> f32 {
-    return params.physics.x * ((1.0 - theta) * kappa[liquid] + theta * kappa[air]);
+    let averaged = sweep_a[liquid];
+    let thin = smoothstep(RESOLVED_CURVATURE, THIN_CURVATURE, abs(averaged) * params.dx);
+    let sharp = (1.0 - theta) * kappa[liquid] + theta * kappa[air];
+
+    return params.physics.x * mix(sharp, averaged, thin);
 }
 
 @compute @workgroup_size(256)
