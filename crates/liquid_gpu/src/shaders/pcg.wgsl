@@ -1,5 +1,4 @@
 override PAIR: u32 = 0u;
-override TARGET: u32 = 0u;
 override COUPLED: bool = false;
 override LEAD: bool = false;
 override TALLY: f32 = 1.0;
@@ -197,10 +196,8 @@ fn pcg_scalar(lane: Lane) {
         solve_live = select(0u, 1u, state.converged == 0u && state.running == 1u);
     }
 
-    if workgroupUniformLoad(&solve_live) == 0u {
-        return;
-    }
-
+    // returning before the reductions crashes WARP under FXC even though the branch is workgroup-uniform
+    let live = workgroupUniformLoad(&solve_live) != 0u;
     var dq = 0.0;
     var rz = 0.0;
 
@@ -213,7 +210,7 @@ fn pcg_scalar(lane: Lane) {
         sum_listed(lane);
     }
 
-    if lane.index != 0u {
+    if lane.index != 0u || !live {
         return;
     }
 
@@ -242,24 +239,6 @@ fn pcg_scalar(lane: Lane) {
         scalars[S_DQ] = dq;
         scalars[S_ALPHA] = select(0.0, rz / dq, dq != 0.0);
     }
-}
-
-@compute @workgroup_size(1)
-fn pcg_start() {
-    scalars[S_RZ] = scalars[S_RZ_NEW];
-}
-
-@compute @workgroup_size(1)
-fn pcg_alpha() {
-    let dq = scalars[S_DQ];
-    scalars[S_ALPHA] = select(0.0, scalars[S_RZ] / dq, dq != 0.0);
-}
-
-@compute @workgroup_size(1)
-fn pcg_beta() {
-    let rz = scalars[S_RZ];
-    scalars[S_BETA] = select(0.0, scalars[S_RZ_NEW] / rz, rz != 0.0);
-    scalars[S_RZ] = scalars[S_RZ_NEW];
 }
 
 @compute @workgroup_size(256)
