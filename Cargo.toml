@@ -1,5 +1,5 @@
 [package]
-name = "bevy-liquid"
+name = "bevy-fluid"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,7 +9,6 @@ bevy = "0.20.1"
 liquid_gpu = { version = "0.1.0", path = "crates/liquid_gpu" }
 liquid_ocean = { version = "0.1.0", path = "crates/liquid_ocean" }
 liquid_wave = { version = "0.1.0", path = "crates/liquid_wave" }
-wgpu = "30.0.2"
 
 [workspace]
 members = ["crates/*"]
