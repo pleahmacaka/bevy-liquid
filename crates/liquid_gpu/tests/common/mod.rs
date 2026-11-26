@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use super::limits;
+
 pub fn assert_compiles_under_fxc(build: impl FnOnce(&wgpu::Device, &wgpu::Queue)) {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
     descriptor.backends = wgpu::Backends::DX12;
@@ -20,7 +22,7 @@ pub fn assert_compiles_under_fxc(build: impl FnOnce(&wgpu::Device, &wgpu::Queue)
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("liquid fxc test"),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device");

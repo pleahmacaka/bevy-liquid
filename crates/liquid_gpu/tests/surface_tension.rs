@@ -1,13 +1,16 @@
 use bevy::math::{UVec3, Vec3};
 use glam::DVec3;
-use liquid_gpu::layout::{GpuParticle, GpuState};
-use liquid_gpu::solver::{Bind, GUARD_BYTES, GpuSolver, SolverConfig};
+use liquid_gpu::layout::{GpuParticle, GpuState, S_CAPILLARY_ITERATIONS, S_VISCOUS_ITERATIONS, SCALAR_COUNT};
+use liquid_gpu::solver::{Bind, GUARD_BYTES, GpuSolver, Quality, SolverConfig};
 use liquid_ref::grid::{Field3, Grid};
 use liquid_ref::levelset::redistance;
 use liquid_ref::particles::{Particle, seed_box};
 use liquid_ref::scene::SEED_JITTER;
 use liquid_ref::sim::{Params, Simulation};
 use liquid_ref::surface_tension::curvature;
+
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
 
 fn gpu() -> (wgpu::Device, wgpu::Queue) {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
@@ -24,7 +27,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("surface tension test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
@@ -212,7 +215,8 @@ impl GpuDroplet {
             tolerance: 1e-6,
             coarse_sweeps: 16,
             surface_tension: SIGMA as f32,
-            viscosity_iterations: 60,
+            viscosity: sim.params.viscosity as f32,
+            viscosity_iterations: if sim.params.viscosity > 0.0 { 300 } else { 60 },
             ..SolverConfig::default()
         };
         let mut solver = validated(&device, || GpuSolver::new(&device, config, None));
@@ -263,11 +267,8 @@ impl GpuDroplet {
     }
 }
 
-#[test]
-fn gpu_droplet_substep_matches_reference() {
-    let mut sim = droplet(8, 1.0);
-
-    for _ in 0..3 {
+fn assert_substep_matches_reference(mut sim: Simulation, warmup: usize, speed_tolerance: f64) {
+    for _ in 0..warmup {
         let dt = sim.cfl_dt();
         sim.substep(dt);
     }
@@ -277,6 +278,7 @@ fn gpu_droplet_substep_matches_reference() {
     let state = gpu.frame();
     let particles = gpu.particles();
     let pressure = gpu.pressure();
+    let scalars: Vec<f32> = read(&gpu.device, &gpu.queue, &gpu.solver.buffers.scalars, SCALAR_COUNT);
     sim.substep(frame_dt as f64);
 
     let radius = equivalent_radius(sim.particles.len(), sim.grid.dx);
@@ -295,16 +297,37 @@ fn gpu_droplet_substep_matches_reference() {
     let laplace = 2.0 * SIGMA / radius;
     let worst = pressure.iter().zip(&sim.pressure).fold(0.0f64, |m, (g, c)| m.max((g - c).abs()));
 
+    let cpu_solve = sim.report.viscosity.or(sim.report.capillary).map_or(0, |s| s.iterations);
+
     println!(
-        "droplet substep (8 cells): dt gpu {:.6e} cpu {frame_dt:.6e}; max |dx| {:.3e} cells, max |dv| {dv:.3e} m/s of vmax {vmax:.3e}; core pressure gpu {gpu_core:.4} cpu {cpu_core:.4} Pa (2 sigma/R {laplace:.4}), max |dp| {worst:.3e} Pa",
+        "droplet substep (8 cells, mu {} Pa s): dt gpu {:.6e} cpu {frame_dt:.6e}; max |dx| {:.3e} cells, max |dv| {dv:.3e} m/s of vmax {vmax:.3e} (relative {:.3e}); core pressure gpu {gpu_core:.4} cpu {cpu_core:.4} Pa (2 sigma/R {laplace:.4}), max |dp| {worst:.3e} Pa ({:.3e} of 2 sigma/R); cg iterations gpu viscous {} capillary {} cpu {cpu_solve}",
+        sim.params.viscosity,
         state.dt,
-        dx / sim.grid.dx
+        dx / sim.grid.dx,
+        dv / vmax,
+        worst / laplace,
+        scalars[S_VISCOUS_ITERATIONS],
+        scalars[S_CAPILLARY_ITERATIONS]
     );
 
     assert_eq!(state.substeps, 1);
+    assert_eq!(sim.report.capillary.is_some(), sim.params.viscosity == 0.0);
     assert!(dx / sim.grid.dx < 1e-3);
-    assert!(dv < 1e-2 * vmax.max(1e-3));
+    assert!(dv < speed_tolerance * vmax.max(1e-3));
     assert!(worst < 1e-3 * laplace);
+}
+
+#[test]
+fn gpu_droplet_substep_matches_reference() {
+    assert_substep_matches_reference(droplet(8, 1.0), 3, 1e-2);
+}
+
+#[test]
+fn gpu_viscous_droplet_substep_matches_reference() {
+    let mut sim = droplet(8, 1.15);
+    sim.params.viscosity = 1.0;
+
+    assert_substep_matches_reference(sim, 10, 1e-3);
 }
 
 #[test]
@@ -481,4 +504,99 @@ fn gpu_static_droplet_stays_still() {
 
     assert!(settled < 0.006);
     assert!(drift < 0.01);
+}
+
+const HONEY_DX: f32 = 0.02;
+
+const SUBCELL_OFFSETS: [Vec3; 3] = [Vec3::ZERO, Vec3::new(0.3, 0.25, 0.2), Vec3::new(-0.4, -0.15, 0.1)];
+
+fn falling_lateral_speed(gpu: &(wgpu::Device, wgpu::Queue), quality: Quality, thread: bool, radius_cells: f32, offset: Vec3, viscosity: f32) -> f32 {
+    let (device, queue) = gpu;
+    let dims = UVec3::new(24, 72, 24);
+    let config = SolverConfig {
+        dims,
+        dx: HONEY_DX,
+        max_particles: 100_000,
+        cfl: 2.5,
+        tolerance: 1e-3,
+        viscosity_iterations: 40,
+        density: 1420.0,
+        viscosity,
+        surface_tension: 4.0,
+        ..SolverConfig::default()
+    }
+    .with_quality(quality);
+    let config = SolverConfig { dims, dx: HONEY_DX, ..config };
+    let size = dims.as_vec3() * HONEY_DX;
+    let radius = radius_cells * HONEY_DX;
+    let half = 10.0 * HONEY_DX;
+    let center = Vec3::new(0.5 * size.x, size.y - 6.0 * HONEY_DX - half, 0.5 * size.z) + offset * HONEY_DX;
+    let mut seed = liquid_gpu::plugin::seed_box(&config, Vec3::ZERO, size);
+
+    seed.retain(|p| {
+        let d = Vec3::new(p.x[0], p.x[1], p.x[2]) - center;
+
+        if thread { d.y.abs() < half && d.x.hypot(d.z) < radius } else { d.length() < radius }
+    });
+
+    let mut solver = validated(device, || GpuSolver::new(device, config, None));
+    solver.initialize(queue);
+    solver.upload_particles(queue, &seed);
+
+    for _ in 0..20 {
+        solver.set_frame_dt(queue, 1.0 / 60.0);
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        validated(device, || solver.encode_frame(&mut encoder, None));
+        queue.submit([encoder.finish()]);
+    }
+
+    let particles: Vec<GpuParticle> = read(device, queue, &solver.buffers.particles, seed.len());
+    let alive: Vec<Vec3> = particles.iter().filter(|p| p.v[3] < 0.5).map(|p| Vec3::new(p.v[0], p.v[1], p.v[2])).collect();
+    let mean = alive.iter().sum::<Vec3>() / alive.len() as f32;
+
+    mean.x.hypot(mean.z)
+}
+
+fn worst_lateral_speed(gpu: &(wgpu::Device, wgpu::Queue), quality: Quality, thread: bool, radius_cells: f32, viscosity: f32) -> f32 {
+    SUBCELL_OFFSETS
+        .into_iter()
+        .map(|o| falling_lateral_speed(gpu, quality, thread, radius_cells, o, viscosity))
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn gpu_falling_thread_keeps_its_lateral_momentum() {
+    let gpu = gpu();
+
+    for quality in [Quality::Game, Quality::High] {
+        for viscosity in [1500.0, 0.0] {
+            for radius in [0.75, 1.0] {
+                let speed = worst_lateral_speed(&gpu, quality, true, radius, viscosity);
+
+                println!(
+                    "{} thread of radius {radius} cells, {viscosity} Pa s, 20 frames of free fall: worst mean lateral speed {speed:.3e} m/s over 3 sub-cell offsets",
+                    quality.name()
+                );
+
+                assert!(speed < 6e-3);
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_falling_ball_keeps_its_lateral_momentum() {
+    let gpu = gpu();
+
+    for quality in [Quality::Game, Quality::High] {
+        let speed = worst_lateral_speed(&gpu, quality, false, 1.5, 0.0);
+
+        println!(
+            "{} ball of radius 1.5 cells, 0 Pa s, 20 frames of free fall: worst mean lateral speed {speed:.3e} m/s over 3 sub-cell offsets",
+            quality.name()
+        );
+
+        assert!(speed < 1e-3);
+    }
 }

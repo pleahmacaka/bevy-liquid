@@ -8,7 +8,10 @@ use liquid_ref::rigid::{Motion, RigidBody, Shape};
 use liquid_ref::scene::{SEED_JITTER, moving, with_body};
 use liquid_ref::sim::{Params, Simulation};
 
-fn gpu(features: wgpu::Features) -> (wgpu::Device, wgpu::Queue) {
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
+fn gpu(features: wgpu::Features, limits: impl FnOnce(wgpu::Limits) -> wgpu::Limits) -> (wgpu::Device, wgpu::Queue) {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
     let instance = INSTANCE.get_or_init(|| wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env()));
     let adapter = pollster::block_on(wgpu::util::initialize_adapter_from_env(instance, None))
@@ -23,10 +26,18 @@ fn gpu(features: wgpu::Features) -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("tall test"),
         required_features: features & adapter.features(),
-        required_limits: adapter.limits(),
+        required_limits: limits(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
+}
+
+fn desktop(supported: wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits {
+        max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+        max_buffer_size: supported.max_buffer_size,
+        ..limits::portable(supported)
+    }
 }
 
 fn read<T: bytemuck::Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer, count: usize) -> Vec<T> {
@@ -210,7 +221,7 @@ fn open_floor_wave() -> Simulation {
 
 #[test]
 fn gpu_tall_cells_match_reference_dense_and_sparse() {
-    let (device, queue) = gpu(wgpu::Features::empty());
+    let (device, queue) = gpu(wgpu::Features::empty(), limits::portable);
     let dt = 1.0 / 120.0;
 
     for (name, scene) in [("sphere in a wave tank", wave_tank as fn() -> Simulation), ("open floor wave", open_floor_wave)] {
@@ -382,7 +393,7 @@ fn deep_pair(device: &wgpu::Device, queue: &wgpu::Queue, particles: &[GpuParticl
 
 #[test]
 fn deep_scene_unknowns_and_pressure_time() {
-    let (device, queue) = gpu(wgpu::Features::TIMESTAMP_QUERY);
+    let (device, queue) = gpu(wgpu::Features::TIMESTAMP_QUERY, desktop);
     let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
     let dx = 1.0 / 64.0;
 

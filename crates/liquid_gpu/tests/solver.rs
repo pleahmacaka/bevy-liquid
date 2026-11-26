@@ -10,6 +10,9 @@ use liquid_ref::transfer::p2g;
 #[cfg(windows)]
 mod common;
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 fn gpu() -> (wgpu::Device, wgpu::Queue) {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
     let instance = INSTANCE.get_or_init(|| wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env()));
@@ -27,7 +30,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("liquid test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
@@ -898,7 +901,7 @@ fn subgroup_gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("liquid subgroup test"),
         required_features: adapter.features() & wgpu::Features::SUBGROUP,
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
@@ -1449,4 +1452,80 @@ fn grid_aligned_box_face_weights_match_reference() {
     println!("grid-aligned box: {closed} closed faces, worst GPU vs CPU weight gap {worst:.2e}");
 
     assert!(worst < 1e-6);
+}
+
+fn sphere_drop(static_solid: bool) -> (f32, [Vec3; 2]) {
+    let (device, queue) = gpu();
+    let (center, radius) = (Vec3::new(0.24, 0.2, 0.24), 0.08);
+    let config = SolverConfig {
+        dims: UVec3::new(24, 32, 24),
+        dx: 0.02,
+        max_particles: 16_384,
+        static_solid,
+        ..SolverConfig::default()
+    };
+    let seed = liquid_gpu::plugin::seed_box(&config, Vec3::new(0.16, 0.4, 0.16), Vec3::new(0.32, 0.56, 0.32));
+    let mut solver = validated(&device, || GpuSolver::new(&device, config.clone(), None));
+    solver.initialize(&queue);
+    solver.set_frame_dt(&queue, 1.0 / 60.0);
+    solver.upload_particles(&queue, &seed);
+
+    if static_solid {
+        let nodes = config.dims + 1;
+        let distances: Vec<f32> = (0..nodes.element_product())
+            .map(|i| UVec3::new(i % nodes.x, (i / nodes.x) % nodes.y, i / (nodes.x * nodes.y)))
+            .map(|p| (p.as_vec3() * config.dx).distance(center) - radius)
+            .collect();
+        solver.upload_static_solid(&queue, &distances);
+    } else {
+        let mass = 1000.0 * 4.0 / 3.0 * std::f32::consts::PI * radius.powi(3);
+        let sphere = liquid_gpu::layout::GpuBody {
+            position: [center.x, center.y, center.z, 1.0 / mass],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0, 0.0, 0.0, 1.0],
+            angular: [0.0; 4],
+            shape: [radius, radius, radius, 0.0],
+            inv_inertia: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        };
+        solver.upload_bodies(&queue, &[sphere]);
+    }
+
+    let mut deepest = f32::MAX;
+    let mut means = [Vec3::ZERO; 2];
+
+    for frame in 1..=60 {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        solver.encode_frame(&mut encoder, None);
+        queue.submit([encoder.finish()]);
+
+        let count = read::<GpuState>(&device, &queue, &solver.buffers.state, 1)[0].particle_count as usize;
+        let particles: Vec<GpuParticle> = read(&device, &queue, &solver.buffers.particles, count);
+        let positions = || particles.iter().map(|p| Vec3::new(p.x[0], p.x[1], p.x[2]));
+        deepest = positions().map(|x| x.distance(center) - radius).fold(deepest, f32::min);
+
+        if let Some(slot) = [SPHERE_CONTACT_FRAME, 60].iter().position(|at| *at == frame) {
+            means[slot] = positions().sum::<Vec3>() / count as f32;
+        }
+    }
+
+    (deepest, means)
+}
+
+const SPHERE_CONTACT_FRAME: usize = 18;
+
+#[test]
+fn static_sdf_sphere_matches_sphere_body() {
+    let (body_depth, body_means) = sphere_drop(false);
+    let (solid_depth, solid_means) = sphere_drop(true);
+    let dx = 0.02;
+
+    println!("deepest particle over the run: body {body_depth:.4} m, static solid {solid_depth:.4} m");
+    println!("mean position: body {body_means:?}, static solid {solid_means:?}");
+    assert!(body_depth < 0.5 * dx, "the liquid never reached the sphere body");
+    assert!(body_depth > -0.5 * dx, "liquid entered the sphere body by {body_depth} m");
+    assert!(solid_depth > -0.5 * dx, "liquid entered the static solid by {solid_depth} m");
+
+    for (body, solid) in body_means.iter().zip(solid_means) {
+        assert!(body.distance(solid) < dx, "mean liquid position differs by {} m", body.distance(solid));
+    }
 }

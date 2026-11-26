@@ -31,7 +31,11 @@ jobs:
       - name: cpu reference tests
         run: cargo test --release -p liquid_ref -p liquid_wave
 
+      - uses: taiki-e/install-action@v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
+
       - name: gpu tests on lavapipe
         run: |
           vulkaninfo --summary
-          cargo test --release -p liquid_gpu -p liquid_ocean -- --test-threads=1
+          cargo nextest run --release -p liquid_gpu -p liquid_ocean --no-fail-fast --test-threads 1

@@ -2,6 +2,9 @@ use bevy::math::{UVec3, Vec3};
 use liquid_gpu::layout::{GpuParticle, GpuState, GpuWhite, GpuWhiteState};
 use liquid_gpu::solver::{GpuSolver, SolverConfig};
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 const SPRAY: f32 = 0.0;
 const CAPACITY: u32 = 1 << 16;
 
@@ -20,7 +23,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("whitewater test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")

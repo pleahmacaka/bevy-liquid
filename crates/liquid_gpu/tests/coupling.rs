@@ -1,10 +1,15 @@
 use bevy::math::{UVec3, Vec3};
 use liquid_gpu::coupling::TierLink;
+use liquid_gpu::emitter::{GpuEmissionState, LiquidEmitter, particle_volume};
+use liquid_gpu::gas::GasRegion;
 use liquid_gpu::layout::{GpuState, S_VOLUME, SCALAR_COUNT};
 use liquid_gpu::solver::{GpuSolver, HeightfieldLink, SolverConfig};
 use liquid_ocean::swe::{self, GpuSwe};
 use liquid_wave::grid::{Bathymetry, Grid, State};
 use liquid_wave::swe::{CouplingRegion, Ledger, Swe};
+
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
 
 const FRAME: f32 = 1.0 / 60.0;
 const HF_DX: f64 = 0.05;
@@ -25,7 +30,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("liquid coupling test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
@@ -334,4 +339,48 @@ fn boundary_velocity_follows_the_airy_profile() {
 
     assert!(checked >= 15);
     assert!(worst < 0.03, "worst boundary velocity error {:.2}%", 100.0 * worst);
+}
+
+#[test]
+fn emitted_volume_enters_the_tier_ledger() {
+    let offset = Vec3::new(1.2, 0.0, 1.2);
+    let plain = start(offset);
+    let mut fed = start(offset);
+    let region = GasRegion::cuboid(Vec3::new(0.4, 0.45, 0.4), Vec3::new(0.2, 0.06, 0.2));
+    let drop = LiquidEmitter { amount: Some(0.05), ..LiquidEmitter::new(region, 293.15) };
+
+    for run in [&plain, &fed] {
+        advance(&run.device, &run.queue, &run.solver, &run.field, 60);
+    }
+
+    fed.solver.set_emitters(&fed.queue, &[drop]);
+
+    let mut gains = Vec::new();
+
+    for _ in 0..6 {
+        for run in [&plain, &fed] {
+            advance(&run.device, &run.queue, &run.solver, &run.field, 60);
+        }
+
+        let spent = read::<GpuEmissionState>(&fed.device, &fed.queue, fed.solver.emission_state(), 1)[0].total;
+        let added = spent as f64 * particle_volume(&fed.solver.config) as f64;
+        let alone = ledger(&plain.device, &plain.queue, &plain.field);
+        let joined = ledger(&fed.device, &fed.queue, &fed.field);
+
+        println!(
+            "{spent} particles emitted for {added:.5} m^3: conserved total {:.5} with the emitter and {:.5} without, 3D tier {:.5} and {:.5}, outside {:.5} and {:.5}",
+            joined.conserved(),
+            alone.conserved(),
+            joined.tier,
+            alone.tier,
+            joined.outside,
+            alone.outside
+        );
+
+        gains.push((joined.conserved() - alone.conserved()) / added);
+    }
+
+    println!("gain of the conserved total over the run without the emitter, as a share of the emitted volume, each second {gains:?}");
+
+    assert!(gains.iter().all(|g| (g - 1.0).abs() < 0.1));
 }

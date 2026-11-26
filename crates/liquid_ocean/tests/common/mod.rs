@@ -1,3 +1,5 @@
+mod limits;
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -48,7 +50,7 @@ fn open(descriptor: wgpu::InstanceDescriptor) -> Gpu {
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("liquid_ocean tests"),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("device request failed");

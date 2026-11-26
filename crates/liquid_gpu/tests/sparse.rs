@@ -7,6 +7,9 @@ use liquid_ref::rigid::{Motion, RigidBody, Shape};
 use liquid_ref::scene::{dam_break, with_body};
 use liquid_ref::sim::Params;
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 fn gpu(features: wgpu::Features) -> (wgpu::Device, wgpu::Queue) {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
     let instance = INSTANCE.get_or_init(|| wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env()));
@@ -22,7 +25,7 @@ fn gpu(features: wgpu::Features) -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("sparse test"),
         required_features: features & adapter.features(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")

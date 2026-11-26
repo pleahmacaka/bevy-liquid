@@ -8,6 +8,9 @@ use wgpu::util::DeviceExt;
 #[cfg(windows)]
 mod common;
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 const DIMS: UVec3 = UVec3::new(40, 32, 36);
 const DX: f32 = 0.0625;
 const ORIGIN: Vec3 = Vec3::new(-1.0, 0.25, 0.5);
@@ -28,7 +31,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("render test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")

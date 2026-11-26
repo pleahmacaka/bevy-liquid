@@ -4,6 +4,9 @@ use wgpu::util::DeviceExt;
 #[cfg(windows)]
 mod common;
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 const SHADER: &str = include_str!("../src/shaders/caustics.wgsl");
 const DIMS: [u32; 3] = [64, 32, 48];
 const DX: f32 = 1.0 / 16.0;
@@ -44,7 +47,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
 
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("caustics test"),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")

@@ -1,7 +1,8 @@
 use bevy::math::{UVec3, Vec3};
 use glam::DVec3;
 use liquid_gpu::layout::{GpuParticle, GpuState, S_VISCOUS_ITERATIONS, SCALAR_COUNT};
-use liquid_gpu::solver::{Bind, Diffusion, GpuSolver, SolverConfig};
+use liquid_gpu::plugin::seed_box;
+use liquid_gpu::solver::{Bind, Diffusion, GpuSolver, Quality, SolverConfig};
 use liquid_ref::grid::{Grid, MacField};
 use liquid_ref::levelset::{face_weights, solid_phi_nodes};
 use liquid_ref::particles::Particle;
@@ -9,11 +10,16 @@ use liquid_ref::scene::dam_break;
 use liquid_ref::sim::{Params, Simulation};
 use liquid_ref::viscosity::{Fractions, ViscositySolve, flatten, unflatten};
 
+#[path = "../../liquid_ocean/tests/common/limits.rs"]
+mod limits;
+
 const LAMB_ROOT: f64 = 5.763_459_196_894_55;
 
 const RADIUS: f64 = 0.1;
 
 const NU: f64 = 0.01;
+
+const FALL_FRAMES: usize = 10;
 
 fn gpu() -> (wgpu::Device, wgpu::Queue) {
     static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
@@ -30,7 +36,7 @@ fn gpu() -> (wgpu::Device, wgpu::Queue) {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("viscosity test"),
         required_features: wgpu::Features::empty(),
-        required_limits: adapter.limits(),
+        required_limits: limits::portable(adapter.limits()),
         ..Default::default()
     }))
     .expect("no device")
@@ -265,6 +271,30 @@ fn gpu_toroidal_mode_decays_like_reference_and_lamb() {
 }
 
 #[test]
+fn gpu_viscous_solve_matches_reference_when_bricks_outnumber_face_groups() {
+    let k = LAMB_ROOT / RADIUS;
+    let dt = 0.1 / (NU * k * k);
+    let solves = 4;
+    let ball = Ball::new(3);
+    let mode = ball.mode();
+    let gpu = GpuBall::new(&ball, dt);
+    let (u, iterations) = gpu.diffuse(&mode, solves);
+    let mut cpu = mode.clone();
+
+    for _ in 0..solves {
+        ball.cpu_diffuse(&mut cpu, dt);
+    }
+
+    let rate = decay_rate(&ball, &u, &mode, solves, dt);
+    let reference = decay_rate(&ball, &cpu, &mode, solves, dt);
+    let difference = (rate - reference).abs() / reference;
+
+    println!("12 cell dense grid: gpu rate {rate:.5} 1/s, cpu rate {reference:.5} 1/s (relative difference {difference:.2e}), max cg iterations {iterations}");
+
+    assert!(difference < 1e-4, "gpu {rate} vs cpu {reference}");
+}
+
+#[test]
 fn gpu_rigid_rotation_survives_strong_viscosity() {
     let ball = Ball::new(10);
     let dt = 50.0 * ball.grid.dx * ball.grid.dx / NU;
@@ -427,4 +457,76 @@ fn gpu_stiff_viscosity_is_stable_far_above_explicit_limit() {
     assert!(viscous.max_iterations < 300.0);
     assert!(viscous.max_speed < free_fall);
     assert!(viscous.front - 0.06 < 0.5 * (inviscid.front - 0.06));
+}
+
+fn falling_thread(device: &wgpu::Device, queue: &wgpu::Queue, quality: Quality) -> (Vec3, f32) {
+    let dims = UVec3::new(16, 40, 16);
+    let dx = 0.02;
+    let config = SolverConfig {
+        dims,
+        dx,
+        max_particles: 8192,
+        density: 1420.0,
+        viscosity: 1500.0,
+        cfl: 2.5,
+        tolerance: 1e-3,
+        viscosity_iterations: 40,
+        ..SolverConfig::default()
+    }
+    .with_quality(quality);
+    let config = SolverConfig { dims, dx, ..config };
+    let size = dims.as_vec3() * dx;
+    let center = Vec3::new(0.5 * size.x + 0.3 * dx, size.y - 14.0 * dx, 0.5 * size.z + 0.2 * dx);
+    let mut seed = seed_box(&config, Vec3::ZERO, size);
+
+    seed.retain(|p| {
+        let r = Vec3::new(p.x[0], p.x[1], p.x[2]) - center;
+
+        r.y.abs() < 10.0 * dx && r.x.hypot(r.z) < 1.5 * dx
+    });
+
+    for (i, p) in seed.iter_mut().enumerate() {
+        p.x[3] = i as f32;
+    }
+
+    let mut solver = validated(device, || GpuSolver::new(device, config, None));
+    solver.initialize(queue);
+    solver.upload_particles(queue, &seed);
+
+    for _ in 0..FALL_FRAMES {
+        solver.set_frame_dt(queue, 1.0 / 60.0);
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        solver.encode_frame(&mut encoder, None);
+        queue.submit([encoder.finish()]);
+    }
+
+    let particles: Vec<GpuParticle> = read(device, queue, &solver.buffers.particles, seed.len());
+    let count = particles.len() as f32;
+    let mean = particles.iter().map(|p| Vec3::new(p.v[0], p.v[1], p.v[2])).sum::<Vec3>() / count;
+    let lateral = (particles.iter().map(|p| p.v[0] * p.v[0] + p.v[2] * p.v[2]).sum::<f32>() / count).sqrt();
+
+    (mean, lateral)
+}
+
+#[test]
+fn gpu_free_falling_viscous_thread_gains_no_lateral_momentum() {
+    let (device, queue) = gpu();
+
+    for quality in [Quality::High, Quality::Game] {
+        let (mean, lateral) = falling_thread(&device, &queue, quality);
+        let fall = 9.81 * FALL_FRAMES as f32 / 60.0;
+
+        println!(
+            "{} thread after {FALL_FRAMES} frames: fall {:.4} m/s, mean lateral ({:.2e}, {:.2e}) m/s, lateral rms {lateral:.2e} m/s",
+            quality.name(),
+            -mean.y,
+            mean.x,
+            mean.z
+        );
+
+        assert!((mean.y + fall).abs() < 1e-3 * fall);
+        assert!(mean.x.abs() < 1e-6 && mean.z.abs() < 1e-6);
+        assert!(lateral < 1e-5);
+    }
 }
