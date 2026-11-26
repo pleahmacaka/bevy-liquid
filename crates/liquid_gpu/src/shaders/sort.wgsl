@@ -13,12 +13,19 @@ fn occupy(b: u32) {
 }
 
 @compute @workgroup_size(256)
-fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
 
     if p < state.particle_count && particles[p].v.w <= 0.5 {
         let c = cell_of(particles[p].x.xyz);
-        atomicAdd(&cell_counter[grid_index(c)], 1u);
+        let g = grid_index(c);
+        let rank = atomicAdd(&cell_counter[g], 1u);
+
+        if CULL_CROWDED && params.physics.z <= 0.0 && rank >= 4u * PER_CELL {
+            atomicSub(&cell_counter[g], 1u);
+            particles[p].v.w = 1.0;
+            return;
+        }
 
         if SPARSE {
             occupy(brick_of(c));
@@ -29,7 +36,7 @@ fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         return;
     }
 
-    for (var t = gid.x; t < brick_list[0] * BRICK_CELLS; t = t + groups.x * WG) {
+    for (var t = gid.x; t < brick_list[0] * BRICK_CELLS; t = t + dispatched_threads(PARTICLE_SLOT)) {
         let n = brick_cell(t);
 
         if n < cell_count() && band_phi[n] < 0.0 {
@@ -213,7 +220,18 @@ fn rank_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
 override SORT_PACK: bool = false;
 
 @compute @workgroup_size(256)
-fn sort_copy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+fn adopt_band(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    for (var n = gid.x; n < grid_cells(); n = n + groups.x * WG) {
+        let m = masked_cell(n);
+
+        if m < cell_count() {
+            phi[m] = band_phi[m];
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn sort_copy(@builtin(global_invocation_id) gid: vec3<u32>) {
     let total = cell_start[grid_cells()];
     let i = gid.x;
 
@@ -221,6 +239,11 @@ fn sort_copy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         let p = particles_out[i];
         particles[i] = p;
         sorted[i] = sorted[params.particle_capacity + i];
+
+        if QUANTIZED {
+            packed[i] = pack_position(p.x.xyz, p.c0.w);
+            pack_motion(i, p);
+        }
 
         if SORT_PACK {
             ellipsoids[i] = vec4<f32>(p.v.xyz, 0.0);
@@ -232,7 +255,7 @@ fn sort_copy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         state.particle_count = total;
     }
 
-    for (var n = i; n < grid_cells(); n = n + groups.x * WG) {
+    for (var n = i; n < grid_cells(); n = n + dispatched_threads(PARTICLE_SLOT)) {
         cell_start[n] = cell_start[n] + bitcast<u32>(partials[n / SCAN_BLOCK]);
         atomicStore(&cell_counter[n], 0u);
 
