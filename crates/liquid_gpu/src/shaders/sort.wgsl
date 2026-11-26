@@ -21,7 +21,7 @@ fn sort_count(@builtin(global_invocation_id) gid: vec3<u32>) {
         let g = grid_index(c);
         let rank = atomicAdd(&cell_counter[g], 1u);
 
-        if CULL_CROWDED && params.physics.z <= 0.0 && rank >= 4u * PER_CELL {
+        if CULL_CROWDED && params.physics.z <= 0.0 && rank >= 8u * PER_CELL {
             atomicSub(&cell_counter[g], 1u);
             particles[p].v.w = 1.0;
             return;
