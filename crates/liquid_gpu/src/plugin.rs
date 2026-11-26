@@ -5,9 +5,13 @@ use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue};
+use bevy::render::settings::{Backends, InstanceFlags, WgpuSettings};
 use bevy::render::storage::{GpuShaderBuffer, ShaderBuffer};
 use bevy::render::{Render, RenderApp, RenderSystems};
 
+use crate::gas_render::{GasDomain, GasPlugin, GasRenderState, GasSimulation, prepare_gas};
+use crate::emitter::LiquidEmitter;
+use crate::heat::{HeatSource, MAX_HEAT_SOURCES};
 use crate::layout::{GpuBody, GpuParticle, MAX_BODIES, S_IMPULSE};
 use crate::render::{
     LiquidMaterial, LiquidMaterialPlugin, LiquidMotionMaterial, LiquidSurfaceSettings, SurfaceBuffers, SurfaceSdf,
@@ -15,18 +19,145 @@ use crate::render::{
 use crate::coupling::TierLink;
 use crate::solver::{GpuSolver, HeightfieldLink, SolverConfig};
 use crate::whitewater::WhitewaterPlugin;
-use liquid_ocean::{Heightfield, LiquidGpu, LiquidSimulation};
+use liquid_ocean::{Heightfield, LiquidGpu, LiquidOceanPlugin, LiquidSimulation, WaterLook};
 use liquid_wave::swe::CouplingRegion;
 
 pub struct LiquidPlugin;
 
 pub const MAX_FRAME_DT: f32 = 1.0 / 30.0;
 
+pub fn wgpu_settings() -> WgpuSettings {
+    // DX12 needs wgpu's indirect-dispatch validation pass to feed num_workgroups, so it stays opt-in through WGPU_BACKEND
+    let backends = Backends::from_env().unwrap_or_else(default_backends);
+    let mut settings = WgpuSettings {
+        backends: Some(backends),
+        ..default()
+    };
+
+    if !cfg!(debug_assertions) && !backends.contains(Backends::DX12) {
+        settings.instance_flags = settings.instance_flags.difference(InstanceFlags::VALIDATION_INDIRECT_CALL).with_env();
+    }
+
+    settings
+}
+
+fn default_backends() -> Backends {
+    let vulkan = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = bevy::tasks::block_on(vulkan.enumerate_adapters(Backends::VULKAN));
+
+    if adapters.iter().any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu) {
+        Backends::all().difference(Backends::DX12)
+    } else {
+        Backends::all()
+    }
+}
+
 #[derive(Component, Clone)]
 pub struct LiquidDomain {
     pub config: SolverConfig,
     pub seed: Arc<Vec<GpuParticle>>,
     pub heightfield: Option<HeightfieldCoupling>,
+    pub boil_into: Option<Entity>,
+    pub look: WaterLook,
+}
+
+impl LiquidDomain {
+    pub fn new(config: SolverConfig) -> Self {
+        Self {
+            config,
+            seed: Arc::default(),
+            heightfield: None,
+            boil_into: None,
+            look: WaterLook::default(),
+        }
+    }
+
+    pub fn with_properties(self, properties: &LiquidProperties) -> Self {
+        Self {
+            config: self.config.with_properties(properties),
+            look: properties.look,
+            ..self
+        }
+    }
+
+    pub fn with_look(self, look: WaterLook) -> Self {
+        Self { look, ..self }
+    }
+
+    pub fn with_seed(self, seed: Vec<GpuParticle>) -> Self {
+        Self { seed: Arc::new(seed), ..self }
+    }
+
+    pub fn filled_where(self, inside: impl Fn(Vec3) -> bool) -> Self {
+        let seed = seed_where(&self.config, inside);
+
+        self.with_seed(seed)
+    }
+
+    pub fn coupled_to(self, heightfield: HeightfieldCoupling) -> Self {
+        Self { heightfield: Some(heightfield), ..self }
+    }
+
+    pub fn boils_into(self, gas: Entity) -> Self {
+        Self { boil_into: Some(gas), ..self }
+    }
+}
+
+#[derive(Component, Clone)]
+pub struct LiquidSolid(pub Arc<Vec<f32>>);
+
+fn solver_config(domain: &LiquidDomain, solid: Option<&LiquidSolid>) -> SolverConfig {
+    SolverConfig { static_solid: solid.is_some(), ..domain.config.clone() }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiquidProperties {
+    pub density: f32,
+    pub viscosity: f32,
+    pub surface_tension: f32,
+    pub adhesion: f32,
+    pub temperature: f32,
+    pub boiling_point: f32,
+    pub latent_heat: f32,
+    pub expansion: f32,
+    pub look: WaterLook,
+}
+
+impl LiquidProperties {
+    pub fn water() -> Self {
+        let config = SolverConfig::default();
+
+        Self {
+            density: config.density,
+            viscosity: config.viscosity,
+            surface_tension: config.surface_tension,
+            adhesion: config.adhesion,
+            temperature: config.temperature,
+            boiling_point: config.boiling_point,
+            latent_heat: config.latent_heat,
+            expansion: config.expansion,
+            look: WaterLook::default(),
+        }
+    }
+}
+
+impl SolverConfig {
+    pub fn with_properties(self, properties: &LiquidProperties) -> Self {
+        Self {
+            density: properties.density,
+            viscosity: properties.viscosity,
+            surface_tension: properties.surface_tension,
+            adhesion: properties.adhesion,
+            temperature: properties.temperature,
+            boiling_point: properties.boiling_point,
+            latent_heat: properties.latent_heat,
+            expansion: properties.expansion,
+            ..self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,6 +197,7 @@ pub struct LiquidImpulse {
 pub struct LiquidFrame {
     pub config: Option<SolverConfig>,
     pub seed: Option<Arc<Vec<GpuParticle>>>,
+    pub solid: Option<Arc<Vec<f32>>>,
     pub generation: u32,
     pub origin: Vec3,
     pub bodies: Vec<GpuBody>,
@@ -77,12 +209,16 @@ pub struct LiquidFrame {
     pub whitewater: Handle<ShaderBuffer>,
     pub surface_view: SurfaceBuffers,
     pub seed_from_heightfield: bool,
+    pub heat_sources: Vec<HeatSource>,
+    pub emitters: Vec<(u64, LiquidEmitter)>,
+    pub boil_offset: Option<Vec3>,
 }
 
 #[derive(Resource, Default)]
 struct LiquidRenderState {
     solver: Option<GpuSolver>,
     generation: u32,
+    gas_generation: Option<u32>,
     sdf: Option<SurfaceSdf>,
     pending_seed: bool,
 }
@@ -109,8 +245,25 @@ fn body_extent(shape: LiquidShape) -> (f32, f32) {
     }
 }
 
+// physics must not advance more time per frame than the liquid solver, or bodies outrun the fluid and the coupling blows up
+pub(crate) fn cap_frame_time(app: &mut App) {
+    if let Some(mut time) = app.world_mut().get_resource_mut::<Time<Virtual>>() {
+        time.set_max_delta(std::time::Duration::from_secs_f32(MAX_FRAME_DT));
+    }
+}
+
 impl Plugin for LiquidPlugin {
     fn build(&self, app: &mut App) {
+        if !app.is_plugin_added::<LiquidOceanPlugin>() {
+            app.add_plugins(LiquidOceanPlugin);
+        }
+
+        if !app.is_plugin_added::<GasPlugin>() {
+            app.add_plugins(GasPlugin);
+        }
+
+        cap_frame_time(app);
+
         app.add_plugins((ExtractResourcePlugin::<LiquidFrame>::default(), LiquidMaterialPlugin, WhitewaterPlugin))
             .init_resource::<LiquidFrame>()
             .init_resource::<ImpulseQueue>()
@@ -121,7 +274,9 @@ impl Plugin for LiquidPlugin {
                     reseed_domain,
                     crate::coupling::follow_promotion,
                     update_frame,
+                    crate::emitter::collect_emitters,
                     link_heightfield,
+                    link_gas,
                     crate::coupling::sync_promotion,
                 )
                     .chain(),
@@ -141,21 +296,21 @@ impl Plugin for LiquidPlugin {
             .insert_resource(ring)
             .insert_resource(feedback)
             .init_resource::<LiquidRenderState>()
-            .add_systems(Render, prepare_solver.in_set(RenderSystems::Prepare))
-            .add_systems(RenderGraph, run_solver.before(camera_driver).before(LiquidSimulation));
+            .add_systems(Render, prepare_solver.in_set(RenderSystems::Prepare).after(prepare_gas))
+            .add_systems(RenderGraph, run_solver.before(camera_driver).before(LiquidSimulation).before(GasSimulation));
     }
 }
 
 fn spawn_domain_view(
     mut commands: Commands,
-    domains: Query<(Entity, &LiquidDomain, &GlobalTransform), Added<LiquidDomain>>,
+    domains: Query<(Entity, &LiquidDomain, Option<&LiquidSolid>, &GlobalTransform), Without<LiquidReady>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
     mut motion_materials: ResMut<Assets<LiquidMotionMaterial>>,
     mut frame: ResMut<LiquidFrame>,
 ) {
-    let Some((entity, domain, transform)) = domains.iter().next() else {
+    let Some((entity, domain, solid, transform)) = domains.iter().next() else {
         return;
     };
 
@@ -168,20 +323,22 @@ fn spawn_domain_view(
 
     let settings = LiquidSurfaceSettings {
         options: Vec4::new(if domain.heightfield.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
-        ..LiquidSurfaceSettings::new(dims, domain.config.dx, origin)
+        ..LiquidSurfaceSettings::new(dims, domain.config.dx, origin).with_quality(domain.config.quality)
     };
-    let material = materials.add(LiquidMaterial::new(&surface_view, settings));
+    let material = materials.add(LiquidMaterial { look: domain.look, ..LiquidMaterial::new(&surface_view, settings) });
     let motion = motion_materials.add(LiquidMotionMaterial::new(&surface_view, settings));
     let mesh = meshes.add(Cuboid::from_size(size));
 
     commands.entity(entity).insert(LiquidReady).with_children(|parent| {
         parent.spawn((
+            LiquidView,
             Mesh3d(mesh.clone()),
             MeshMaterial3d(material),
             Transform::from_translation(size * 0.5),
             bevy::camera::visibility::NoFrustumCulling,
         ));
         parent.spawn((
+            LiquidView,
             Mesh3d(mesh),
             MeshMaterial3d(motion),
             Transform::from_translation(size * 0.5),
@@ -189,8 +346,11 @@ fn spawn_domain_view(
         ));
     });
 
-    frame.config = Some(domain.config.clone());
+    frame.whitewater = crate::whitewater::whitewater_buffer(domain.config.whitewater_capacity, &mut buffers);
+    frame.config = Some(solver_config(domain, solid));
     frame.seed = Some(domain.seed.clone());
+    frame.solid = solid.map(|s| s.0.clone());
+    frame.seed_from_heightfield = false;
     frame.generation += 1;
     frame.origin = origin;
     frame.surface = surface;
@@ -249,14 +409,36 @@ type BodyQuery<'w, 's> = Query<
 #[derive(Component)]
 struct LiquidReady;
 
+#[derive(Component)]
+struct LiquidView;
+
+type ChangedDomains<'w, 's> =
+    Query<'w, 's, (Entity, &'static LiquidDomain, Option<&'static LiquidSolid>), (Changed<LiquidDomain>, With<LiquidReady>)>;
+
 fn reseed_domain(
-    domains: Query<&LiquidDomain, (Changed<LiquidDomain>, With<LiquidReady>)>,
+    mut commands: Commands,
+    domains: ChangedDomains,
+    views: Query<(Entity, &ChildOf), With<LiquidView>>,
     mut frame: ResMut<LiquidFrame>,
 ) {
-    if let Some(domain) = domains.iter().next() {
+    let Some((entity, domain, solid)) = domains.iter().next() else {
+        return;
+    };
+
+    if frame.config.as_ref() == Some(&solver_config(domain, solid)) {
         frame.seed = Some(domain.seed.clone());
+        frame.solid = solid.map(|s| s.0.clone());
         frame.generation += 1;
         frame.seed_from_heightfield = false;
+        return;
+    }
+
+    commands.entity(entity).remove::<LiquidReady>();
+
+    for (view, parent) in &views {
+        if parent.parent() == entity {
+            commands.entity(view).despawn();
+        }
     }
 }
 
@@ -293,6 +475,12 @@ fn apply_impulses(
     let Some(config) = frame.config.as_ref() else {
         return;
     };
+    let pushed = |e: &Entity| shapes.get(*e).is_ok_and(|b| b.dynamic) || impulses.contains(*e);
+
+    if !frame.body_entities.iter().any(pushed) {
+        return;
+    }
+
     let Some(values) = device.and_then(|d| feedback.take(d.wgpu_device(), frame.index)) else {
         return;
     };
@@ -349,6 +537,7 @@ fn prepare_solver(
     queue: Res<RenderQueue>,
     buffers: Res<RenderAssets<GpuShaderBuffer>>,
     heightfields: Option<Res<LiquidGpu>>,
+    gas: Option<Res<GasRenderState>>,
 ) {
     let (Some(config), Some(seed)) = (&frame.config, &frame.seed) else {
         return;
@@ -364,8 +553,13 @@ fn prepare_solver(
         solver.initialize(&queue);
         solver.upload_particles(&queue, seed);
 
+        if let Some(solid) = &frame.solid {
+            solver.upload_static_solid(&queue, solid);
+        }
+
         state.solver = Some(solver);
         state.generation = frame.generation;
+        state.gas_generation = None;
         state.sdf = None;
         state.pending_seed = frame.seed_from_heightfield;
     }
@@ -389,6 +583,8 @@ fn prepare_solver(
 
     solver.upload_bodies(&queue, &frame.bodies);
     solver.set_frame_dt(&queue, frame.frame_dt);
+    solver.set_keyed_emitters(&queue, &frame.emitters);
+    link_boiling(solver, &mut state.gas_generation, &frame, gas.as_deref(), device.wgpu_device(), &queue);
 
     let (Some(link), Some(heightfields)) = (frame.link, heightfields) else {
         return;
@@ -426,6 +622,42 @@ fn prepare_solver(
         solver.encode_seed(&mut encoder);
         queue.submit([encoder.finish()]);
     }
+}
+
+fn link_boiling(
+    solver: &mut GpuSolver,
+    attached: &mut Option<u32>,
+    frame: &LiquidFrame,
+    gas: Option<&GasRenderState>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    let target = gas.and_then(|g| Some((g.solver()?, g.generation())));
+    let (Some(offset), Some((gas, generation))) = (frame.boil_offset, target) else {
+        heat_without_gas(solver, attached, frame, device, queue);
+        return;
+    };
+
+    if gas.config.injection_capacity == 0 {
+        warn_once!("the liquid boils into a gas domain without injection capacity, so nothing boils");
+        heat_without_gas(solver, attached, frame, device, queue);
+        return;
+    }
+
+    if *attached != Some(generation) {
+        solver.attach_gas(device, gas);
+        *attached = Some(generation);
+    }
+
+    solver.set_heat(queue, &frame.heat_sources, offset);
+}
+
+fn heat_without_gas(solver: &mut GpuSolver, attached: &mut Option<u32>, frame: &LiquidFrame, device: &wgpu::Device, queue: &wgpu::Queue) {
+    if attached.take().is_some() {
+        solver.detach_gas(device);
+    }
+
+    solver.set_heat(queue, &frame.heat_sources, Vec3::ZERO);
 }
 
 fn link_heightfield(
@@ -468,6 +700,17 @@ fn link_heightfield(
     frame.link = Some(FrameLink { coupling, offset });
 }
 
+fn link_gas(domains: Query<&LiquidDomain>, gases: Query<&GasDomain>, sources: Query<(Entity, &HeatSource)>, mut frame: ResMut<LiquidFrame>) {
+    let origin = frame.origin;
+    let target = domains.iter().next().and_then(|d| d.boil_into).and_then(|e| gases.get(e).ok());
+    let mut list: Vec<_> = sources.iter().collect();
+    list.sort_by_key(|(e, _)| *e);
+    list.truncate(MAX_HEAT_SOURCES);
+
+    frame.boil_offset = target.map(|gas| gas.origin - origin);
+    frame.heat_sources = list.into_iter().map(|(_, s)| s.shifted(-origin)).collect();
+}
+
 #[derive(bevy::ecs::system::SystemParam)]
 struct Readbacks<'w> {
     ring: Res<'w, crate::diagnostics::DiagnosticsRing>,
@@ -489,9 +732,10 @@ fn run_solver(
 
     let Readbacks { ring, feedback, device, queue } = readbacks;
     let encoder = render_context.command_encoder();
-    ring.encode_frame(device.wgpu_device(), &queue, encoder, solver);
+    let late = solver.config.late_surface;
+    ring.encode_frame(device.wgpu_device(), &queue, encoder, solver, state.sdf.as_ref().filter(|_| late));
 
-    if let Some(sdf) = &state.sdf {
+    if let Some(sdf) = state.sdf.as_ref().filter(|_| !late) {
         sdf.encode(encoder);
     }
 
@@ -513,21 +757,29 @@ fn run_solver(
 }
 
 pub fn seed_box(config: &SolverConfig, lo: Vec3, hi: Vec3) -> Vec<GpuParticle> {
+    seed_where(config, |x| x.cmpge(lo).all() && x.cmplt(hi).all())
+}
+
+pub fn seed_where(config: &SolverConfig, inside: impl Fn(Vec3) -> bool) -> Vec<GpuParticle> {
     let dims = config.dims;
     let mut out = Vec::new();
 
     for k in 0..dims.z {
         for j in 0..dims.y {
             for i in 0..dims.x {
-                for s in 0..8u32 {
+                for s in 0..config.particles_per_cell {
                     let cell = UVec3::new(i, j, k);
-                    let sub = UVec3::new(s & 1, (s >> 1) & 1, (s >> 2) & 1).as_vec3();
+                    let sub = sub_octant(config.particles_per_cell, s).as_vec3();
                     let jitter = seed_jitter(cell, s) - 0.5;
                     let x = (cell.as_vec3() + (sub + 0.5 + 0.8 * jitter) * 0.5) * config.dx;
 
-                    if x.cmpge(lo).all() && x.cmplt(hi).all() {
+                    if inside(x) {
                         let id = out.len() as f32;
-                        out.push(GpuParticle { x: [x.x, x.y, x.z, id], ..Default::default() });
+                        out.push(GpuParticle {
+                            x: [x.x, x.y, x.z, id],
+                            c: [[0.0, 0.0, 0.0, config.temperature], [0.0; 4], [0.0; 4]],
+                            ..Default::default()
+                        });
                     }
                 }
             }
@@ -535,6 +787,13 @@ pub fn seed_box(config: &SolverConfig, lo: Vec3, hi: Vec3) -> Vec<GpuParticle> {
     }
 
     out
+}
+
+fn sub_octant(per_cell: u32, s: u32) -> UVec3 {
+    let (x, y) = (s & 1, (s >> 1) & 1);
+    let z = if per_cell < 8 { x ^ y } else { (s >> 2) & 1 };
+
+    UVec3::new(x, y, z)
 }
 
 fn seed_jitter(cell: UVec3, sub: u32) -> Vec3 {
